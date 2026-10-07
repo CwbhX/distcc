@@ -95,13 +95,15 @@ enum dcc_compress {
 enum dcc_cpp_where {
     /* weird values to catch errors */
     DCC_CPP_ON_CLIENT     = 42,
-    DCC_CPP_ON_SERVER
+    DCC_CPP_ON_SERVER,
+    DCC_CPP_MIRROR              /**< helper compiles in its mirrored tree */
 };
 
 enum dcc_protover {
     DCC_VER_1   = 1,            /**< vanilla */
     DCC_VER_2   = 2,            /**< LZO sprinkles */
-    DCC_VER_3   = 3             /**< server-side cpp */
+    DCC_VER_3   = 3,            /**< server-side cpp */
+    DCC_VER_4   = 4             /**< mirrored tree, see doc/protocol-4.txt */
 };
 
 

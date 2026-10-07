@@ -118,11 +118,19 @@ const char *arg_sysroot = NULL;
 
 int opt_job_lifetime = 0;
 
+/** Mirror mode: directories (resolved with realpath) whose contents the
+ * daemon may compile in place, and the installed-tree prefixes whose files
+ * are compared by digest. **/
+char **opt_mirror_roots = NULL;
+int opt_n_mirror_roots = 0;
+const char *arg_mirror_installed = NULL;
+
 /* Enumeration values for options that don't have single-letter name.  These
  * must be numerically above all the ascii letters. */
 enum {
     opt_log_to_file = 300,
-    opt_log_level
+    opt_log_level,
+    opt_mirror_root
 };
 
 #ifdef HAVE_AVAHI
@@ -155,6 +163,8 @@ const struct poptOption options[] = {
     { "help", 0,         POPT_ARG_NONE, 0, '?', 0, 0 },
     { "inetd", 0,        POPT_ARG_NONE, &opt_inetd_mode, 0, 0, 0 },
     { "lifetime", 0,     POPT_ARG_INT, &opt_lifetime, 0, 0, 0 },
+    { "mirror-root", 0,  POPT_ARG_STRING, 0, opt_mirror_root, 0, 0 },
+    { "mirror-installed", 0, POPT_ARG_STRING, &arg_mirror_installed, 0, 0, 0 },
     { "listen", 0,       POPT_ARG_STRING, &opt_listen_addr, 0, 0, 0 },
     { "log-file", 0,     POPT_ARG_STRING, &arg_log_file, 0, 0, 0 },
     { "log-level", 0,    POPT_ARG_STRING, 0, opt_log_level, 0, 0 },
@@ -221,6 +231,9 @@ static void distccd_show_usage(void)
 "    --whitelist=FILE           control client access through a whitelist\n"
 #endif
 "    --sysroot=DIR              search resource file in this directory\n"
+"  Mirrored-tree mode (protocol 4):\n"
+"    --mirror-root DIR          compile in place under DIR (repeatable)\n"
+"    --mirror-installed LIST    colon-separated trees compared by digest\n"
 "    --stats                    enable statistics reporting via HTTP server\n"
 "    --stats-port PORT          TCP port to listen on for statistics requests\n"
 #ifdef HAVE_AVAHI
@@ -385,6 +398,27 @@ int distccd_parse_options(int argc, const char **argv)
 	        break;
 	    }
 #endif
+
+        case opt_mirror_root: {
+            char resolved[MAXPATHLEN + 1];
+            char **n;
+            const char *dir = poptGetOptArg(po);
+            if (!dir || !realpath(dir, resolved)) {
+                rs_log_error("--mirror-root %s: %s", dir ? dir : "",
+                             strerror(errno));
+                exitcode = EXIT_BAD_ARGUMENTS;
+                goto out_exit;
+            }
+            n = realloc(opt_mirror_roots,
+                        (opt_n_mirror_roots + 1) * sizeof *n);
+            if (!n || !(n[opt_n_mirror_roots] = strdup(resolved))) {
+                exitcode = EXIT_OUT_OF_MEMORY;
+                goto out_exit;
+            }
+            opt_mirror_roots = n;
+            opt_n_mirror_roots++;
+            break;
+        }
 
         case 'W':
             /* catchall for running under gdb */

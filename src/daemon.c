@@ -76,6 +76,8 @@
 #include "dopt.h"
 #include "srvnet.h"
 #include "daemon.h"
+#include "mirror.h"
+#include "confine.h"
 #include "types.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
@@ -153,6 +155,33 @@ static int dcc_setup_daemon_path(void)
     }
 }
 
+/**
+ * Mirror mode is only offered when every compile can be confined to its job
+ * directory; refuse to start otherwise.
+ **/
+static int dcc_mirror_daemon_setup(void)
+{
+    int i;
+
+    if (opt_n_mirror_roots == 0)
+        return 0;
+    if (opt_enable_tcp_insecure) {
+        rs_log_error("--mirror-root cannot be combined with --enable-tcp-insecure");
+        return EXIT_BAD_ARGUMENTS;
+    }
+    if (dcc_mirror_set_installed_prefixes(arg_mirror_installed))
+        return EXIT_OUT_OF_MEMORY;
+    if (!dcc_confine_available() || dcc_confine_probe() != 0) {
+        rs_log_error("--mirror-root needs write confinement, which is not "
+                     "available here; refusing to start");
+        return EXIT_DISTCC_FAILED;
+    }
+    for (i = 0; i < opt_n_mirror_roots; i++)
+        rs_log_info("mirror root: %s", opt_mirror_roots[i]);
+    return 0;
+}
+
+
 static void dcc_warn_masquerade_whitelist(void) {
     DIR *d, *e;
     const char *warn = "You must set up masquerade" \
@@ -223,6 +252,9 @@ int main(int argc, char *argv[])
     }
 
     if ((ret = dcc_setup_daemon_path()))
+        goto out;
+
+    if ((ret = dcc_mirror_daemon_setup()))
         goto out;
 
 #ifdef HAVE_GSSAPI

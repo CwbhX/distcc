@@ -241,6 +241,7 @@ common_obj = src/arg.o src/argutil.o					\
 	src/sendfile.o							\
 	src/safeguard.o src/snprintf.o src/timeval.o			\
 	src/dotd.o 							\
+	src/mirror.o src/mirror_digest.o src/sha256.o			\
 	src/hosts.o src/hostfile.o					\
 	src/implicit.o src/loadfile.o					\
 	lzo/minilzo.o                                                   \
@@ -248,6 +249,7 @@ common_obj = src/arg.o src/argutil.o					\
 	@AUTH_COMMON_OBJS@
 
 distcc_obj = src/backoff.o						\
+	src/mirror_client.o						\
 	src/climasq.o src/clinet.o src/clirpc.o				\
 	src/compile.o src/cpp.o						\
 	src/distcc.o							\
@@ -263,6 +265,7 @@ distcc_obj = src/backoff.o						\
 
 distccd_obj = src/access.o						\
 	src/daemon.o  src/dopt.o src/dparent.o src/dsignal.o		\
+	src/confine.o src/mirror_serve.o				\
 	src/ncpus.o							\
 	src/prefork.o							\
 	src/stringmap.o							\
@@ -308,8 +311,10 @@ h_fix_debug_info = src/h_fix_debug_info.o $(common_obj)
 h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/timefile.o \
                 src/backoff.o src/emaillog.o src/remote.o src/clinet.o \
 	        src/clirpc.o src/include_server_if.o src/state.o src/where.o \
-		src/ssh.o src/strip.o src/cpp.o @AUTH_DISTCC_OBJS@
+		src/ssh.o src/strip.o src/cpp.o src/mirror_client.o \
+		@AUTH_DISTCC_OBJS@
 h_getline_obj = src/h_getline.o $(common_obj)
+h_mirror_obj = src/h_mirror.o $(common_obj)
 
 # All source files, for the purposes of building the distribution
 SRC =	src/stats.c							\
@@ -325,6 +330,8 @@ SRC =	src/stats.c							\
 	src/h_exten.c src/h_hosts.c src/h_issource.c src/h_parsemask.c	\
 	src/h_sa2str.c src/h_scanargs.c src/h_strip.c			\
 	src/h_dotd.c src/h_compile.c src/h_getline.c			\
+	src/h_mirror.c src/mirror.c src/mirror_digest.c src/sha256.c	\
+	src/confine.c src/mirror_client.c src/mirror_serve.c		\
 	src/help.c src/history.c src/hosts.c src/hostfile.c		\
 	src/implicit.c src/io.c						\
 	src/loadfile.c src/lock.c 					\
@@ -367,6 +374,8 @@ HEADERS = src/stats.h							\
 	src/exec.h src/lock.h src/where.h src/srvnet.h			\
 	src/rslave.h							\
 	src/dotd.h src/include_server_if.h				\
+	src/mirror.h src/sha256.h src/confine.h				\
+	src/mirror_client.h src/mirror_serve.h				\
 	src/emaillog.h 							\
 	src/va_copy.h 							\
 	src/zeroconf.h
@@ -424,7 +433,8 @@ check_PROGRAMS = \
 	h_strip@EXEEXT@ \
 	h_dotd@EXEEXT@ \
 	h_compile@EXEEXT@ \
-	h_getline@EXEEXT@
+	h_getline@EXEEXT@ \
+	h_mirror@EXEEXT@
 
 check_include_server_PY = \
 	include_server/c_extensions_test.py \
@@ -534,6 +544,9 @@ h_ccvers@EXEEXT@: $(h_ccvers_obj)
 
 h_dotd@EXEEXT@: $(h_dotd_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(h_dotd_obj) $(LIBS)
+
+h_mirror@EXEEXT@: $(h_mirror_obj)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(h_mirror_obj) $(LIBS)
 
 h_fix_debug_info@EXEEXT@: $(h_fix_debug_info)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(h_fix_debug_info) $(LIBS)
