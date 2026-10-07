@@ -181,9 +181,46 @@ What the numbers support:
   flat from 12 to 24 slots. Half its cores are efficiency cores, which is why
   per-job time roughly doubles between 1 and 12 concurrent jobs.
 
+## Status of the code changes (2026-10-06, later the same day)
+
+Implemented on the `mac-pool-perf` branch:
+
+- Preprocessor slots lock `cpp_localhost_<n>` (`src/lock.c`), so
+  `--localslots_cpp` no longer needs to be oversized. Finding 1.
+- `dcc_lock_one()` blocks in the kernel on one busy slot (F_SETLKW with a
+  SIGALRM timeout) instead of sleeping; `DISTCC_PAUSE_TIME_MSEC` is now the
+  rescan bound and defaults to 100 ms (`src/where.c`). `dcc_lock_host()` maps
+  EINTR to `EXIT_BUSY`. Finding 2.
+- `configure --disable-pump-mode` skips the include server and `pump`;
+  without a setuptools-capable Python, pump mode is left out with a warning
+  (error only with an explicit `--enable-pump-mode`). macOS prerequisites
+  are in INSTALL. Finding 4 is confirmed fixed by this tree's configure: a
+  bare `distcc clang` to the helper returns objects identical to local ones.
+- Finding 3 and the mirrored-tree idea are designed, not implemented:
+  see `doc/mirrored-tree-design.md`.
+
+Merged-tree benchmark (appendix script, same day, M6 idle):
+
+| Client | Env | `--localslots_cpp` | J | Total jobs/s | Helper jobs/s |
+|---|---|---|---|---|---|
+| Homebrew 3.4 | `PAUSE=20` | 15 | 27 | 14.9 | 7.2 |
+| Homebrew 3.4 | `PAUSE=20` | 40 | 27 | 15.5 | 7.4 |
+| Homebrew 3.4 | `PAUSE=20` | 15 | 40 | 13.2 | 5.3 |
+| Homebrew 3.4 | `PAUSE=20` | 40 | 40 | 14.2 | 7.1 |
+| This branch | none | 15 | 27 | 14.5 | 7.0 |
+| This branch | none | 40 | 27 | 14.9 | 7.1 |
+| This branch | none | 15 | 40 | 14.6 | 7.0 |
+| This branch | none | 40 | 40 | 14.7 | 7.1 |
+
+With no environment tuning and the stock `--localslots_cpp`, the branch
+holds the helper at about 7 jobs/s in every configuration, where the 3.4
+client needed both `DISTCC_PAUSE_TIME_MSEC=20` and `--localslots_cpp=40`
+to get there and still dropped to 5.3 when oversubscribed with the stock
+cpp count. `make distcc-maintainer-check` passes on the merged tree.
+
 ## Proposed code changes
 
-In rough order of value. None are started.
+In rough order of value, as written before the work above was done.
 
 1. **Stop a remote job from holding its remote slot while it waits for a cpp
    slot.** Options to evaluate:
