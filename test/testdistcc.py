@@ -520,6 +520,8 @@ class ScanArgs_Case(SimpleDistCC_Case):
     def runtest(self):
         cases = [("gcc -c hello.c", "distribute", "hello.c", "hello.o"),
                  ("gcc hello.c", "local"),
+                 ("clang++ -x c++-header -Xclang -emit-pch -c pch.hxx.cxx -o pch.hxx.pch", "local"),
+                 ("clang++ -x c++-header -c pch.hxx -o pch.hxx.pch", "local"),
                  ("gcc -o /tmp/hello.o -c ../src/hello.c", "distribute", "../src/hello.c", "/tmp/hello.o"),
                  ("gcc -DMYNAME=quasibar.c bar.c -c -o bar.o", "distribute", "bar.c", "bar.o"),
                  ("gcc -ohello.o -c hello.c", "distribute", "hello.c", "hello.o"),

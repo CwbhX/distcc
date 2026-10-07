@@ -1,6 +1,8 @@
 # Design: mirrored-tree mode
 
-Status: proposal, 2026-10-06. Nothing here is implemented. It follows on from
+Status: implemented on the `mac-pool-perf` branch, 2026-10-07 (steps 1-3 of
+the plan below, plus the fixes from a design audit); results are in
+"Results". The wire format is in `doc/protocol-4.txt`. It follows on from
 `doc/perf-findings-two-mac-pool.md` (same two Macs, same Ohmly workload).
 
 ## The idea
@@ -11,12 +13,14 @@ precompiled header (PCH). In **mirrored-tree mode** the helper has the source
 tree, the build tree, the PCH files and the external headers at the same
 absolute paths as the host. The client sends only the command and the working
 directory. The daemon runs the compiler on the source in that directory, so it
-preprocesses locally and loads the PCH. Results come back as today.
+preprocesses locally and loads the PCH. Results come back as today, with a
+description of every file and directory the compile used, which the client
+checks against its own before it accepts the object.
 
 What it removes per remote job: host cpp time and the local cpp lock, the
 helper slot sitting idle while the host preprocesses, the `.ii` transfer, and
-the missing-PCH penalty on the helper. What it adds: a sync step outside
-distcc, and a way to prove the mirror was current.
+the missing-PCH penalty on the helper. What it adds: a sync step
+(`distcc --mirror-sync`), and a way to prove the mirror was current.
 
 ## Part A: what the PCH is worth on Ohmly (measured on the host)
 
@@ -127,33 +131,33 @@ PCH/non-PCH ratio matches the host's.
   staleness check below exists mainly to prevent that.
 - Ninja passes `-MD -MT $out -MF $DEP_FILE` (`build-dev/CMakeFiles/rules.ninja`).
 
-## Host-list syntax
+## Host-list syntax and configuration
 
-`172.31.250.2/12,mirror`
+`172.31.250.2:3634/12,mirror`
 
-- `,mirror` sets `host->cpp_where = DCC_CPP_MIRROR` (new enum value in
-  `src/distcc.h`) and `protover = DCC_VER_4`. Parsed in `dcc_parse_options`
-  (`src/hosts.c:239`) next to `,cpp`.
-- `,mirror` and `,cpp` together is a hostspec error. `,lzo` with `,mirror` is
-  rejected at first (the payload is one `.o`; compression can come later by
-  adding a feature word to the version 4 request).
-- `DISTCC_MIRROR_PATHMAP=/Volumes/ExternalSSD/Developer/Ohmly/build-dev=/Users/clementhathaway/Git/Ohmly/build-dev`
-  (colon-separated `physical=logical` prefix pairs). The client rewrites the
-  physical cwd's prefix to the logical one before sending `CDIR`, and first
-  checks that both name the same directory on the host (same device and
-  inode); if not, the job does not use mirror mode. `$PWD` is not used: it
-  is wrong whenever ninja runs with `-C`.
-- Optional client filter `DISTCC_MIRROR_ROOTS=/Users/clementhathaway/Git/Ohmly`,
-  matched against the cwd after mapping. Jobs whose cwd is outside these
-  roots use the classic path to the same host. The same roots tell
-  `distcc --mirror-sync` what to copy. Without the filter every job tries
-  mirror first; a miss costs one round trip (~0.4 ms on this link) plus a
-  reconnect.
-- **No local cpp lock.** For a mirrored job, `dcc_build_somewhere` must skip
-  `dcc_lock_local_cpp` (`src/compile.c:777`). The client does only a few
-  `stat`s before sending and a few thousand after. This sidesteps findings 1
-  and 3 of the perf doc for mirrored jobs; `localslots_cpp` then only matters
-  for fallbacks and non-mirror hosts.
+- `,mirror` sets `host->cpp_where = DCC_CPP_MIRROR` and `protover =
+  DCC_VER_4` (`src/hosts.c`). `,mirror` with `,cpp` is a hostspec error.
+  `,lzo` may be combined: mirrored jobs are never compressed (the payload is
+  one `.o`), but a job that falls back to the classic path uses it.
+- **No local cpp lock.** A mirrored job never calls `dcc_lock_local_cpp`; the
+  client only `stat`s files. This sidesteps findings 1 and 3 of the perf doc
+  for mirrored jobs; `localslots_cpp` only matters for fallbacks and
+  non-mirror hosts.
+
+Client environment (all optional except where noted):
+
+| Variable | Meaning |
+|---|---|
+| `DISTCC_MIRROR_PATHMAP` | `physical=logical` prefix pairs, colon-separated. The physical cwd is sent under its logical name, after checking that both are the same directory (device and inode); otherwise the job takes the classic path. `$PWD` is not used: it is wrong whenever ninja runs with `-C`. The logical sides are also the build trees. |
+| `DISTCC_MIRROR_ROOTS` | Synced source roots. Jobs whose (mapped) cwd is outside them take the classic path. Also what `--mirror-sync` copies. |
+| `DISTCC_MIRROR_EXCLUDE` | Globs left out at the top of each root (e.g. `.git:build-release:output:tmp`), both by the sync and by directory identity. |
+| `DISTCC_MIRROR_EXTRA` | More trees to sync whole (Ohmly: the kicad-mac-builder dest dirs). |
+| `DISTCC_MIRROR_INSTALLED` | Installed-tree prefixes; default `/Library/Developer/CommandLineTools:/Applications/Xcode.app:/opt/homebrew`. Sent to the daemon, which uses the same list. |
+| `DISTCC_MIRROR_SSH`, `DISTCC_MIRROR_RSH` | Sync destinations (else every `,mirror` host's address) and the ssh command for rsync. |
+
+Daemon options: `--mirror-root DIR` (repeatable; the cwd and the input must
+resolve under one) and `--mirror-installed LIST` (default when a client
+sends no list).
 
 ## Protocol: a new version 4
 
@@ -166,88 +170,52 @@ semantics. Old daemons reject `DIST 4` (`dcc_r_request_header`,
 `src/srvrpc.c`), so `,mirror` against an old daemon fails the connection and
 the client backs off that host; document that `,mirror` needs a new daemon.
 
-Request:
+The request carries the cwd, argv, the check list, the compiler identity
+(`CVER`), the environment that changes what the compiler reads (`ENVS`)
+and the rules for directory identity (`RULE`). The response starts with
+`MIRR` (0, or a refusal code followed by a reason, `MIRM`), then, as in
+protocol 2, `STAT`, `SERR`, `SOUT`, `DOTO`, and finally `DOTD` (the `.d`)
+and `DSTA` (the identity of every file and directory the compile used).
+`doc/protocol-4.txt` has every token.
 
-```text
-DIST 4
-CDIR <cwd>                  physical cwd after DISTCC_MIRROR_PATHMAP
-ARGC/ARGV                   argv after dcc_scan_args and client rewrites; original -o, -MF, -MT kept
-NCHK <n>                    check list (see Staleness): the input, every PCH operand,
-                            every -include operand and its implicit PCH candidates
-  CHKN <path> CHKX <0 absent | 1 present> CHKS <size> CHKM <mtime seconds>
-                            repeated n times; CHKS and CHKM are 0 when absent
-```
+The check list is never empty: the input, and every PCH the compile can
+load, because the `.d` does not list it. A client that cannot classify a
+PCH- or module-related option in argv does not use mirror mode for that job.
 
-The check list is never empty and is complete from the first release: it
-must name every PCH the compile can load, because the `.d` does not. A client
-that cannot classify every PCH-related option in argv (`-include-pch` and
-`-include` in their driver, `-Xclang` and `-Xpreprocessor` spellings) does not
-use mirror mode for that job (classic path, or local before step 2).
-
-Response:
-
-```text
-DONE 4
-MIRR <code>    0 = compiled; nonzero = not attempted, nothing follows:
-               1 mirror disabled / cwd not under a root, 2 pre-check mismatch,
-               3 argument refused by policy, 4 cwd or input missing,
-               5 write confinement could not be established
-STAT, SERR, SOUT, DOTO      as protocol 2
-DOTD <bytes>   the .d, target already set to the client's output name
-DSTA <bytes>   text, one line per .d entry plus each check-list path:
-               "<size> <mtime_s> <digest> <path>", or "absent <path>";
-               <digest> is "sha256:<hex>" for paths under an installed
-               tree and "-" elsewhere (see Staleness)
-```
-
-Client side, `dcc_retrieve_results` (`src/clirpc.c:153`) writes the `.o` to a
-temp file, not to `output_fname`. It parses `DSTA`, `stat`s each path
-locally (following symlinks, since the compiler read the target), and only
-on a full match renames the `.o` into place and writes the
-`.d` to `deps_fname`. A full match also requires every path of the check list
-the client sent to appear in `DSTA`; the client does not rely on the daemon
-to echo it. About 3000 `stat`s is a few milliseconds; digests come from a
-cache (see Staleness).
+The client writes the `.o` and `.d` next to their destinations and renames
+them into place only after the check passes, and holds the compiler's
+stdout back until then.
 
 ## Daemon side
 
-New code path in `dcc_run_job` (`src/serve.c:647`), taken when
-`cpp_where == DCC_CPP_MIRROR`:
+`dcc_run_job` (`src/serve.c`) hands protocol 4 to `dcc_mirror_serve`
+(`src/mirror_serve.c`):
 
-1. Refuse (`MIRR 1`) unless the daemon was started with one or more
-   `--mirror-root DIR` (new option in `src/dopt.c`). `realpath(cwd)` and
-   `realpath(input)` must lie under a root; this resolves `..` and symlinks.
-2. Run the pre-check `stat`s on the check list. Mismatch: `MIRR 2`, with the
-   differing path in the log. This catches the common cases (source edited
-   since the sync, PCH rebuilt and not yet synced) before any compile time is
-   spent. The early rejection is an optimisation (step 2 of the plan); the
-   correctness check is the client's comparison of the same paths in `DSTA`,
-   which step 1 already does.
-3. Argument policy (`MIRR 3`). The existing checks stay (compiler whitelist,
-   `-fplugin=`, `-specs=`). Output-writing options are either rewritten or
-   refused:
-   - `-o` becomes a daemon temp file (`dcc_set_output`). `-MF` becomes the
-     temp `deps_fname`. `-MD` is added if absent, so a `.d` always exists for
-     the stat check. `-MT` is kept (client adds `-MT <output>` when it needs a
-     `.d` and set no target, as pump mode does at `src/compile.c:843`).
-   - Refused: `-save-temps*`, `-ftime-trace*`, `-gsplit-dwarf`,
-     `-serialize-diagnostics`, `-fmodules`/`-fmodules-cache-path`,
-     `-fcrash-diagnostics-dir`, `-emit-pch`, `-x *-header`. `-Xclang`
-     operands are allowlisted (`-include-pch`, `-include`, and anything else
-     observed in real builds) rather than denylisted, which also blocks
-     `-Xclang -load`.
-4. Create a fresh per-job temp dir and establish write confinement for the
-   compiler (below). If that fails for any reason, answer `MIRR 5` and do
-   not spawn the compiler. `TMPDIR` points at the job dir, and the temp
-   `.o`, `.d` and captured stderr/stdout all live in it.
-5. `chdir(cwd)`, spawn the compiler under the confinement,
-   `chdir(dcc_daemon_wd)` after (the existing restore at `out_cleanup`
-   already handles this).
-6. Return `DOTO` from the temp `.o`. No `dcc_fix_debug_info`: paths are
-   already the client's. Return `DOTD` and build `DSTA` from the `.d`
-   (parser in `src/dotd.c`, handling `\ ` escapes and line continuations),
-   plus every check-list path, because the PCH does not appear in the `.d`,
-   with digests for installed-tree paths.
+1. Read the whole request before answering anything, so that an early
+   refusal never leaves unread bytes behind (closing then would reset the
+   connection and the client would back off a healthy host).
+2. Refuse (`MIRR 1`) unless the daemon has a `--mirror-root` and the cwd
+   and the input resolve (`realpath`) under one; `MIRR 4` if either is
+   missing.
+3. Argument policy (`MIRR 3`): the classic checks (compiler whitelist or
+   `DISTCC_CMDLIST`, `-fplugin=`, `-specs=`), plus refused output and
+   module options (`-save-temps*`, `-ftime-trace*`, `-gsplit-dwarf`,
+   `-serialize-diagnostics`, `-fmodules*`, `-fcrash-diagnostics*`,
+   `-emit-pch`, `-x *-header`, `-MJ`, `-fprofile*`, ...). `-Xclang` and
+   `-Xpreprocessor` operands are allowlisted (`-include-pch`, `-include`,
+   `-imacros`), which also blocks `-Xclang -load`.
+4. Apply the client's environment list, then compare the compiler binary's
+   SHA-256 with the client's (`MIRR 6`).
+5. Pre-check (`MIRR 2`): synced check-list files must have the client's
+   size and mtime. This catches the common stale cases (source edited since
+   the sync, PCH rebuilt and not synced) before any compile time is spent.
+6. Make a fresh job directory, point `-o` and `-MF` into it (an existing
+   `-MF` is replaced; `-MD` is added, and `-MMD` becomes `-MD` so that
+   system headers are listed and checked too), set `TMPDIR` to it, and run
+   the compiler there under write confinement (`MIRR 5` if that fails).
+7. While still in the cwd, describe every file of the `.d` and of the check
+   list and every directory that took part in the include search (see
+   Staleness), then answer. The job directory is removed recursively.
 
 **Never write into the mirror: OS-enforced write confinement.** Outputs go
 to the per-job temp dir and are shipped back, so the host's build tree stays
@@ -272,6 +240,12 @@ OS, and it is required from the first shippable release:
   its job dir and succeed inside it) and refuses to start if not. Per job,
   any failure to set it up is `MIRR 5`: mirror jobs never run unconfined.
   A platform without a qualifying mechanism has no mirror mode.
+- Implementation (`src/confine.c`): `sandbox_init()` with a Seatbelt
+  profile (`deny file-write*`, allow under the job dir and `/dev/null`,
+  `deny network*`) in the forked child, after closing every descriptor
+  above 2 (the audit showed Seatbelt still allows `write()` on an inherited
+  descriptor, such as the client's socket). A close-on-exec pipe tells the
+  daemon whether the profile was applied.
 
 **Security, honestly stated.** Today a client can only make the daemon
 compile a `.ii` it sent. In mirror mode an allowed client can make the
@@ -319,8 +293,8 @@ Two checks, in order:
 
 - **Pre-check** (daemon, before compiling): size and mtime of every
   check-list path in a synced tree; installed-tree paths are left to the
-  post-check. A handful of `stat`s; fails fast with `MIRR 2`. This is an
-  optimisation and can arrive after step 1.
+  post-check. A handful of `stat`s; fails fast with `MIRR 2`. An
+  optimisation, not the correctness check.
 - **Post-check** (client, `DSTA`): the identity of every file the compile
   actually read according to the `.d`, **and of every check-list path**,
   compared on the host before the object is accepted. This covers headers,
@@ -358,24 +332,67 @@ about 0.1 s on each side and a cached one only the `stat`s (0.05 s for all
 6413). The distcc client is one process per job, so its cache has to live
 on disk.
 
-The remaining blind spot is in the synced trees: an edit that keeps both
-size and mtime, e.g. a tool restoring the mtime after a same-length change.
-Ninja's rebuild logic makes the same assumption.
+**Directory identity: include-search shadowing.** Comparing the files a
+compile read is not enough. If the client has a header in a directory
+searched before the one where the helper found its copy (a header added
+after the sync, a directory filtered out of the sync, an `-I` directory
+missing on the helper), the client's own compile would read a different
+file although every listed file matches. So `DSTA` also describes every
+directory that took part in the include search: every `-I`, `-isystem`,
+`-iquote`, `-idirafter`, `-F` and `-iframework` operand, the directory of
+every file read (this covers the includer's directory for `"..."`
+includes), and the cwd. A directory's identity is the SHA-256 of its sorted
+entries (`<kind><name>`, the kind of a symlink being its target's),
+ignoring what the sync deliberately leaves out: the top-level excludes of
+each root, and in build trees every file that is not a source, header or
+PCH (so objects written during the build do not count).
+
+- Synced directories must have the same identity.
+- Installed directories (`/opt/homebrew/include` on the M6 has 45 entries,
+  the host's 180) are sent with their entries and may differ only in names
+  that are not a component of any path the compile read (`X.framework` also
+  counts as `X`): an include spelling is always a suffix of the path it
+  resolved to, so a header that could shadow it has its first component
+  among those names. The check is order-blind, so it can reject a job whose
+  differing directory comes later in the search; on Ohmly one name, `fmt`,
+  does so for 115 of 3491 TUs, which then take the classic path.
+
+Directory hashes are cached like file digests, keyed by the directory's
+`stat` (an entry added or removed changes its mtime and ctime).
+
+**Compiler identity and environment.** The `.d` does not list the
+compiler, and ccache keys on the host's compiler, so a helper with another
+clang would put its objects under the host's key. The client sends the
+SHA-256 of the binary its argv[0] runs (on macOS `/usr/bin` stubs are
+resolved through `DEVELOPER_DIR` or the xcode-select link); a mismatch is
+`MIRR 6`. Variables that change what the compiler reads (`CPATH`,
+`C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`, `OBJC_INCLUDE_PATH`, `SDKROOT`,
+`DEVELOPER_DIR`, `MACOSX_DEPLOYMENT_TARGET`, `CCC_OVERRIDE_OPTIONS`, ...)
+are forwarded and set exactly for the compiler.
+
+The remaining blind spots: in synced trees, an edit that keeps both size
+and mtime (ninja makes the same assumption); files read but not listed in
+the `.d` (`.incbin`, possibly `#embed`); a `..` spelling that leaves an
+installed directory; and a dangling symlink in an installed tree whose
+target appears without the directory changing.
 
 What happens when stale:
 
 | Where detected | Action |
 |---|---|
-| `MIRR 1/2/4` | Classic path on the same host: reconnect with protocol 1/2, take the local cpp lock, preprocess, send the `.ii`. The helper slot is still held. Do not call `bad_host`; the daemon is healthy. (Step 1: compile locally instead.) |
-| `MIRR 3` | Same, and log the refused argument once. |
-| `MIRR 5` | Same, and log once that the helper cannot confine mirror jobs. |
-| Remote compile failed (e.g. PCH rejected by clang, `-Winvalid-pch`, or a write denied by the confinement) | Existing logic: `dcc_critique_status` then local retry (`src/compile.c:935`). Clang accepting a PCH is not evidence that it is current; that is the post-check's job. |
-| Post-check mismatch, including a check-list path missing from `DSTA` | Discard `.o` and `.d`, compile locally (simplest, and the slot was already spent). Log the first differing path. |
+| Job not mirrorable (outside the roots, untracked PCH option, bad path map) | Classic path to the same host. |
+| `MIRR` 1-6 | Classic path to the same host (protocol 1/2: take the local cpp lock, preprocess, send the `.ii`); the host slot is still held. The reason (`MIRM`) is logged. The host is not marked bad. |
+| Compile failed in the mirror | Classic path to the same host, since the mirror may be at fault (a file missing there). A real error fails there too and is then retried locally as usual. |
+| Check mismatch, or a required file or directory missing from `DSTA` | Discard `.o`, `.d` and stdout; classic path to the same host. Log the first differing path. |
+| Connection or protocol error | As for any host: back off and pick another. |
+
+An old daemon rejects `DIST 4` and closes the connection, so `,mirror`
+needs a new daemon on the helper.
 
 **Getting files onto the helper: `distcc --mirror-sync`.** No git is
 involved: the sync copies the working tree as it is on disk, uncommitted
-edits included. It is a new client mode, so the build script runs one
-command before `ninja` instead of a hand-written rsync phase:
+edits included (`src/mirror_sync.c`). The build script runs it between
+building the PCHs and the rest:
 
 ```sh
 ninja <PCH targets> <generated headers>   # build outputs the compiles read
@@ -383,22 +400,23 @@ distcc --mirror-sync                      # copy them and the sources
 ninja                                     # the build, with ,mirror active
 ```
 
-For each `,mirror` host (or the ssh destinations given on the command line,
-e.g. `distcc --mirror-sync m6`) it runs `rsync -a --delete` over ssh, with
-filters, for:
+For each destination (arguments, `DISTCC_MIRROR_SSH`, or every `,mirror`
+host) it runs `ssh mkdir -p` for the roots, then `rsync -a -W --delete`:
 
-1. **Sources:** each `DISTCC_MIRROR_ROOTS` root, only code files (`*.h`,
-   `*.hpp`, `*.hxx`, `*.inc`, `*.ipp`, `*.c`, `*.cc`, `*.cpp`, `*.cxx`,
-   `*.m`, `*.mm`; configurable), skipping `.git` and build dirs. Ohmly's
-   compiles read 6498 such files (104 MB) out of a 1.42 GB tree. `--delete`
-   within the filter removes headers deleted on the host, so a stale copy
-   cannot shadow another include path.
-2. **Build outputs:** the logical build dirs from `DISTCC_MIRROR_PATHMAP`,
-   only `*.pch`, `cmake_pch.hxx*` and generated code files (121 files,
-   41 MB, plus 628 MB of PCHs on Ohmly). `-a` keeps the mtimes the
-   post-check compares.
-3. **Extra trees** listed in `DISTCC_MIRROR_EXTRA` (Ohmly: the
-   kicad-mac-builder dest dirs), copied whole.
+1. **Sources:** each `DISTCC_MIRROR_ROOTS` root, whole, except the
+   `DISTCC_MIRROR_EXCLUDE` names at its top and any build tree inside it.
+   Whole, not filtered by extension, because directory identity compares
+   entries: a filtered sync would leave the helper's directories different
+   (or, worse, equal in name while files the filter dropped are missing).
+2. **Build trees** (logical sides of `DISTCC_MIRROR_PATHMAP`): every
+   directory, and only sources, headers and PCHs (the same selection
+   directory identity uses).
+3. **Extra trees** (`DISTCC_MIRROR_EXTRA`), whole.
+
+`-a` keeps the mtimes the checks compare; `-W` skips delta computation,
+which costs more than sending a changed PCH over this link. The first sync
+of Ohmly took 11.2 s (2.0 GB, of which 675 MB build tree); see Results for
+a re-sync.
 
 Homebrew kegs and the CLT are not synced: they are installed on the M6 at
 the host's versions (exact kegs copied and pinned, see Facts) and checked by
@@ -413,21 +431,6 @@ itself when the daemon reports it (40–113 MB, 0.3–0.7 s), but that writes
 into the mirror during a build, so the daemon would also have to record
 each check-list file's inode before and after the compile and reject the
 job if it changed.
-
-Sizes and times from the host (estimates where marked):
-
-| Item | Size | Transfer |
-|---|---|---|
-| Source code files read by compiles | 104 MB of a 1.42 GB tree | first copy: < 5 s at the measured rate (estimate); unchanged re-sync: file walk under the 3.6 s measured for the whole tree (local `rsync -an` dry run) |
-| 9 PCH files | 658 MB | 3.9 s for all nine (measured: streamed over `ssh m6` to `wc -c`, ~170 MB/s) |
-| Generated code in `build-dev` | 165 files, 46 MB | < 1 s (estimate) |
-| kicad-mac-builder dest dirs | 238 MB whole (copied once on 2026-10-06), ~10 MB of headers | < 1 s when unchanged (estimate) |
-| Homebrew include trees (boost 179 MB, opencascade 43 MB, ...) | 273 MB via `/opt/homebrew/include` | done once: the 16 kegs Ohmly reads were copied from the host (~660 MB with libraries) and pinned; redo for any formula upgraded on the host |
-
-A dry run to the M6 itself was not done: openrsync might create the
-destination directory even with `-n`, and creating files there was out of
-scope. Any header change that rebuilds a PCH costs one 40–113 MB copy
-(~0.3–0.7 s at the measured rate).
 
 ## ccache and `dev-tools/distcc-clang.sh`
 
@@ -445,12 +448,11 @@ scope. Any header change that rebuilds a PCH costs one 40–113 MB copy
 
 ## Failure modes
 
-- **Compiler mismatch** (the state until 2026-10-07). Every PCH job fails
-  remotely and retries locally: a slow pool. Mitigation: match Command Line Tools first.
-  A later `CVER` token (cached `clang --version` per compiler path) would let
-  the daemon answer `MIRR` instead of wasting a compile.
-- **Sync forgotten or racing with edits.** Pre-check and post-check send the
-  job to classic or local. Correct output, lost speed.
+- **Compiler mismatch** (the state until 2026-10-07): every job is refused
+  with `MIRR 6` and takes the classic path. Mitigation: match Command Line
+  Tools.
+- **Sync forgotten or racing with edits.** The checks send the job to the
+  classic path. Correct output, lost speed.
 - **Mirror silently diverges** in a file the compile reads but `.d` does not
   list. The PCH is the known case and is covered by the check list, which
   the post-check includes from step 1; `#embed`/`.incbin` data files are
@@ -458,114 +460,164 @@ scope. Any header change that rebuilds a PCH costs one 40–113 MB copy
   itself.
 - **Installed trees drift** (a `brew upgrade` or CLT update on one Mac):
   every job that reads a changed header fails the digest comparison and
-  compiles locally until the versions match again. Correct output, lost
-  speed. Differing mtimes alone cost nothing.
+  takes the classic path until the versions match again. Correct output,
+  lost speed. Differing mtimes alone cost nothing.
 - **Write confinement unavailable** (no `sandbox-exec`, profile rejected, a
   platform without an equivalent): the daemon refuses to start with
   `--mirror-root`, or answers `MIRR 5` per job. Mirror jobs never run
   unconfined.
-- **Old daemon with `,mirror`**: connection fails, host backed off. Document
-  it; do not auto-downgrade.
-- **Disk on the M6**: about 1.7 GB for source code, build subset, PCHs,
-  kicad-mac-builder and the copied Homebrew kegs; it has 135 GB free.
+- **Old daemon with `,mirror`**: connection fails, host backed off.
+- **Disk on the M6**: about 3.3 GB (2.0 GB mirror, the copied Homebrew kegs
+  and kicad-mac-builder); it has 135 GB free.
+- **Spotlight on the helper** indexes the mirror after each sync. Excluding
+  `~/Git` in Spotlight's privacy settings on the M6 needs the user (admin).
 
-## Implementation plan (smallest shippable step first)
+## Implementation plan and status
 
-0. **Manual proof, no code.** Match CLT versions; set up the mirror for one
-   TU; run its exact command over `ssh m6` in the same cwd; `cmp` the `.o`
-   with the host's; time with and without PCH on the M6; check whether any
-   PCH is chained to another. Settles path identity, PCH compatibility and
-   the real M6 saving. Done on 2026-10-06: external-header parity (all 6984
-   identical in content, mtimes not), openrsync mtime precision,
-   `sandbox-exec` confinement of a real compile (writes to the mirror,
-   `$HOME` and `/tmp`, `-Wp,-MD,<mirror>`, `-save-temps=cwd` and `-o
-   <mirror>` all denied; a malformed profile makes `sandbox-exec` exit 65
-   without running anything), the PCH version error, and (2026-10-07,
-   after matching CLT) a host-built PCH loading on the M6 with
-   byte-identical output, and the argv of a real Ohmly compile (only
-   outputs are relative, so the physical cwd need not exist on the M6).
-   Still open: the first sync of sources and build outputs, and the one-TU
-   proof itself.
-1. **Mirror protocol with complete post-check, write confinement and local
-   fallback.**
-   `src/distcc.h` (`DCC_CPP_MIRROR`, `DCC_VER_4`); `src/hosts.c`
-   (`dcc_parse_options`, both protover/feature mappings); `src/compile.c`
-   (`dcc_build_somewhere`: skip the cpp lock, build server argv with `-MT`
-   as for pump); `src/remote.c` (`dcc_send_header`/`dcc_compile_remote`:
-   version 4 branch, no `DOTI`); `src/clirpc.c` (`dcc_retrieve_results`:
-   `MIRR`, `DOTD`, `DSTA`, temp-then-rename); `src/srvrpc.c` (accept 4
-   only with `--mirror-root`); `src/serve.c` (`dcc_run_job` mirror branch,
-   per-job temp dir, spawning the compiler under the confinement, `MIRR 5`);
-   `src/dopt.c` (`--mirror-root`, startup confinement probe); new
-   `src/mirror.c` (argv policy, check list, `.d` parsing, stat lists,
-   installed-tree digests and their on-disk cache);
-   `doc/protocol-4.txt`; localhost cases in `test/testdistcc.py` for the
-   acceptance checks below that can run on one machine. The check list is
-   complete in this step: input, every PCH operand, every `-include` and
-   its implicit PCH candidates, all verified by the client in `DSTA`.
-   Write confinement is OS-enforced in this step, and the daemon refuses
-   mirror jobs when it cannot establish it. Any `MIRR != 0` or check
-   failure means local compile.
-2. **Daemon pre-check and classic-path fallback**: early `MIRR 2` from the
-   check list, and the classic path on the same host for `MIRR != 0`
-   (reuse the pump-mode pattern of switching `host->cpp_where` and
-   `protover` mid-job, `src/compile.c:806`). Add `DISTCC_MIRROR_ROOTS`.
-   These save time; they do not add correctness, which step 1 already has.
-3. **`distcc --mirror-sync`** (`src/mirror_sync.c`, building rsync and ssh
-   argv from `DISTCC_HOSTS`, `DISTCC_MIRROR_ROOTS`,
-   `DISTCC_MIRROR_PATHMAP` and `DISTCC_MIRROR_EXTRA`), `ohmly.sh` calling it
-   after building the PCHs, and a re-run of the pool benchmark on a real
-   Ohmly rebuild.
-4. Later: `CVER` compiler identity, LZO, a distccmon phase for mirrored
-   jobs.
+0. **Manual proof.** Done 2026-10-06/07: external-header parity, openrsync
+   mtime precision, `sandbox-exec` confinement of a real compile, the PCH
+   version error and, after matching CLT, a host-built PCH loading on the
+   M6 with byte-identical output, and the argv of a real Ohmly compile.
+1. **Protocol 4 with the complete check, confinement and fallback.** Done:
+   `src/mirror.c` (check list, file identity, `.d` parser, DSTA format),
+   `src/mirror_ident.c` (directory identity, required sets, compiler
+   identity, environment list), `src/mirror_digest.c` (persistent digest
+   cache), `src/sha256.c`, `src/mirror_client.c` and `src/remote.c`
+   (`dcc_compile_mirror`), `src/compile.c` (mirror branch in
+   `dcc_build_somewhere`), `src/mirror_serve.c`, `src/confine.c`,
+   `src/dopt.c`/`src/daemon.c` (`--mirror-root`, `--mirror-installed`,
+   startup probe), `doc/protocol-4.txt`, 17 test cases.
+2. **Pre-check and classic-path fallback.** Done (folded into step 1): `MIRR
+   2` from the check list, and every refusal or mismatch goes the classic
+   way to the same host without marking it bad.
+3. **`distcc --mirror-sync`.** Done. Ohmly's `ohmly.sh` is not changed by
+   this work; see Results for how the benchmark drove it.
+4. Later: an order-aware shadowing check for installed directories (to stop
+   the `fmt` false rejections), pushing a missing PCH on demand, a distccmon
+   phase for mirrored jobs.
 
 `src/lock.c` and `src/where.c` need no change for mirror mode; it simply
 never calls `dcc_lock_local_cpp`.
 
-## Acceptance checks for step 1
+## Acceptance checks
 
-Step 1 ships only when each of these passes with the host as client and the M6
-as mirror. Staleness cannot be produced on localhost, where client and daemon
-see the same files, so the stale-PCH and same-size checks need the two
-machines; the `DSTA`-omission variant and the confinement checks also run as
-localhost cases in `test/testdistcc.py`. "Rejected" means the remote object is
-discarded, the job compiles locally, the final `.o` and `.d` are
-byte-identical to a plain local compile, and the ccache entry written for the
-job holds that local object.
+Each is a case in `test/testdistcc.py` (localhost; the daemon describes a
+file or directory differently through `DISTCC_TESTING_MIRROR_*` hooks, so
+staleness can be produced on one machine). "Rejected" means the remote
+object is not used, the job goes the classic way, and the result is still
+right.
 
-- **Stale PCH.** A header containing `__TIME__`, a PCH built from it and a
-  TU using it via `-include-pch`. Sync, wait more than a second, rebuild the
-  PCH on the host without touching the header, do not sync. The mirror job
-  is rejected on the PCH's path, although clang accepts the old PCH and the
-  `.d` and its metadata are unchanged. Variants: the PCH named through
-  `-Xclang -include-pch`, `-Xpreprocessor -include-pch` and the driver
-  option; an implicit `H.pch` present on the mirror but absent on the host;
-  a daemon (test build) that omits a check-list path from `DSTA`. All are
-  rejected.
-- **Same-size header change.** Change one digit of a constant in a header
-  the TU includes directly (not through the PCH), so its size is unchanged,
-  more than a second after the sync, and do not sync. The job is rejected
-  on that header's path. Repeat for a header under `/opt/homebrew`, edited
-  only on the M6 and then given back its old mtime (`touch -r`): rejected
-  on the digest. Restore the original content, leaving a different mtime:
-  accepted, since installed trees are compared by content.
-- **Write outside the job temp dir.** A test compiler (allowed through the
-  daemon's compiler whitelist) that tries to create or modify a file in the
-  mirror root, in the cwd, in `$HOME` and in `/tmp`, then writes its `.o`
-  normally. Every outside write fails with a permission error, none of the
-  files exists afterwards, and a listing of the mirror (paths, sizes,
-  mtimes) is identical before and after. A real compile with an
-  output-writing option that slipped past the argument policy (test build
-  with the policy off, e.g. `-Wp,-MD,<mirror path>`) fails remotely and is
-  retried locally, and the mirror is unchanged.
-- **Logical cwd.** A job started from the physical build dir is sent with
-  the mapped logical cwd and accepted; with a `DISTCC_MIRROR_PATHMAP` entry
-  whose two sides are different directories on the host, the job does not
-  use mirror mode.
-- **Confinement unavailable.** With confinement setup forced to fail (test
-  hook, or the `sandbox-exec` binary unavailable), `distccd --mirror-root`
-  refuses to start; with the failure injected per job, the daemon answers
-  `MIRR 5`, spawns no compiler, and the client compiles locally.
+| Check | Test case |
+|---|---|
+| Mirrored compile; `.d` identical to a local compile's | `Mirror_Case` |
+| Stale PCH (same size, other mtime) | `MirrorStalePch_Case` |
+| Same-size header change | `MirrorStaleHeader_Case` |
+| A file or a search directory missing from `DSTA` | `MirrorOmittedFile_Case`, `MirrorOmittedDir_Case` |
+| Shadowing: a synced search directory differs | `MirrorShadow_Case` |
+| Installed directory lacks an unrelated entry (accepted) / an entry a path was spelled through (rejected) | `MirrorInstalledHarmless_Case`, `MirrorInstalledShadow_Case` |
+| Helper compiler differs (`MIRR 6`) | `MirrorCompiler_Case` |
+| Confinement unavailable per job (`MIRR 5`) | `MirrorNoConfine_Case` |
+| cwd outside every root (`MIRR 1`) | `MirrorOutsideRoot_Case` |
+| Forwarded environment (`CPATH`) | `MirrorEnv_Case` |
+| Path map used / refused when it names another directory | `MirrorPathmap_Case`, `MirrorBadPathmap_Case` |
+| Compiler writes in the mirror and next to it are denied | `MirrorConfined_Case` |
+| `--mirror-root` refuses to start with `--enable-tcp-insecure` or a failing probe | `MirrorStartRefused_Case` |
+| SHA-256, `.d` escapes, DSTA parsing | `MirrorHelper_Case` |
+
+On the real pair: 40 Ohmly TUs compiled in the mirror gave objects and `.d`
+files byte-identical to local compiles; Results has the full set.
+
+## Results (2026-10-07)
+
+Benchmark: every Ohmly TU in `compile_commands.json` except the nine
+`-emit-pch` ones (3481), run as ninja runs them (through ccache with the
+user's ccache config but a fresh, empty cache directory, `-MD -MT -MF`,
+cwd `build-dev`), with objects written outside the Ohmly tree, which is only
+read. Driver: `bench2.py` in the session scratchpad (not kept); it is a
+thread pool over the commands. Host M5 Pro (15 cores, 48 GB), helper M6
+(12 cores, 16 GB), both clang-2100.3.34.2, Thunderbolt bridge. Mirror runs
+after one `distcc --mirror-sync`.
+
+| Configuration | Time | TUs/s | TUs on the M6 | vs local |
+|---|---|---|---|---|
+| Local only, 15 jobs | 472.0 s | 7.38 | 0 | 1.00x |
+| Homebrew distcc 3.4, M6/12 + localhost/15, `--localslots_cpp=40`, `DISTCC_PAUSE_TIME_MSEC=20`, 27 jobs (the existing setup) | 319.5 s | 10.90 | 1457 | 1.48x |
+| This branch, classic, M6/12 + localhost/15, 27 jobs | 316.3 s | 11.01 | 1457 | 1.49x |
+| This branch, classic, M6/14 + localhost/17, 31 jobs | 290.0 s | 12.00 | 1429 | 1.63x |
+| **Mirror**, M6/12 + localhost/15, 27 jobs | 256.2 s | 13.59 | 1606 | 1.84x |
+| **Mirror**, M6/14 + localhost/15, 29 jobs | 245.0 s | 14.21 | 1657 | 1.93x |
+| **Mirror**, M6/16 + localhost/15, 31 jobs | 244.2 s | 14.25 | 1642 | 1.93x |
+| **Mirror**, M6/14 + localhost/17, 31 jobs | 241.4 s | 14.42 | 1679 | 1.96x |
+
+- Mirror mode is 24% faster than the existing setup and 17% faster than the
+  classic path with the same tuned slot counts. The design estimated +10-20%.
+- The pool is now at the two machines' combined capacity: in the 12+15 run
+  the host compiled 1875 TUs at 7.32/s against 7.38/s when compiling alone,
+  so a mirrored job costs the host almost nothing, and the M6 added 6.3/s.
+  The M6 takes 14 slots on 12 cores (load ~17, at least 66% of memory free,
+  no swapping at 16 slots); more does not help.
+- Every mirrored job was accepted (one conservative rejection in one run,
+  see below). All 3481 objects of the 12+15 mirror run are byte-identical
+  to the local run except `common/build_version.cpp`, which was compiled
+  locally and embeds the build time; all `.d` files are identical apart
+  from the output name. A real `ninja` rebuild of 60 PCH TUs through the
+  mirror pool gave 60 of 60 objects identical to the local ones.
+- `distcc --mirror-sync`: first copy 11.2 s (2.0 GB), unchanged re-sync
+  3.0-3.1 s.
+
+The first full runs found three problems that the localhost tests could
+not, all fixed:
+
+1. ccache's `base_dir` turns paths into `../../../../../Users/...`; the
+   directory classification compared those unnormalized, so the source
+   root's excludes did not apply and 233 jobs were rejected.
+2. ccache adds `-fpch-preprocess`; the conservative "untracked PCH option"
+   rule kept 685 jobs from trying the mirror at all.
+3. A PCH records its inputs under the client's physical cwd
+   (`/Volumes/ExternalSSD/.../build-dev/../../../../../Users/...`), which
+   the M6 cannot open: 697 PCH TUs failed in the mirror and were redone the
+   classic way. Fixed with the per-job clang VFS overlay (see Daemon side).
+
+The remaining rejection: a TU for which `/opt/homebrew/include` (where the
+M6 lacks Homebrew's `fmt`) comes before the directory its `fmt` headers
+could have been found through, so the helper's result is rightly not
+trusted.
+
+## Using it with Ohmly
+
+Nothing in Ohmly was changed. On the M6 the new daemon runs next to the
+Homebrew one (which stays on port 3632):
+
+```sh
+~/.local/distcc-mirror/bin/distccd --daemon --listen 172.31.250.2 --port 3634 \
+  --allow 172.31.250.1/32 --jobs 14 --mirror-root ~/Git/Ohmly \
+  --log-file ~/Library/Logs/distccd-mirror.log --pid-file ~/.local/distcc-mirror/distccd.pid
+```
+
+It was started by hand and does not survive a reboot; a LaunchAgent like
+the existing `com.ohmly.distccd` with these arguments would make it
+permanent. On the host (both binaries are in `~/.local/distcc-mirror`,
+statically linked against popt so they need no Homebrew on the M6):
+
+```sh
+export OHMLY_DISTCC_BIN=$HOME/.local/distcc-mirror/bin/distcc
+export DISTCC_HOSTS="172.31.250.2:3634/14,mirror localhost/17"
+export DISTCC_MIRROR_ROOTS=$HOME/Git/Ohmly
+export DISTCC_MIRROR_EXCLUDE=".git:build-release:output:tmp"
+export DISTCC_MIRROR_PATHMAP="/Volumes/ExternalSSD/Developer/Ohmly/build-dev=$HOME/Git/Ohmly/build-dev"
+export DISTCC_MIRROR_EXTRA="$HOME/Github/kicad-mac-builder/build/wxwidgets-dest:$HOME/Github/kicad-mac-builder/build/python-dest:$HOME/Github/kicad-mac-builder/build/ngspice-dest"
+export DISTCC_MIRROR_SSH=m6
+export CCACHE_PREFIX=$HOME/Git/Ohmly/dev-tools/distcc-clang.sh
+contrib/mirror-build.sh ~/Git/Ohmly/build-dev -j31     # PCHs, sync, build
+```
+
+`dev-tools/ohmly.sh` cannot be used for this unchanged: it checks that
+`~/.distcc/hosts` names `172.31.250.2` without options, and it does not run
+the sync. `dev-tools/distcc-clang.sh` keeps working (its `-Xpreprocessor`
+rewrite is still what the classic fallback needs); its per-job
+`/usr/bin/clang -dumpmachine` (about 35 ms of host CPU per job) is no longer
+needed with this tree's client. distcc now also keeps PCH generation local
+by itself (`-x *-header`, `-emit-pch`), as the wrapper already did.
 
 ## Expected gain (estimates)
 

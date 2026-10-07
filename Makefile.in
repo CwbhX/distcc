@@ -122,6 +122,7 @@ dist_contrib = contrib/distcc-absolutify	\
 	contrib/distccd-init		\
 	contrib/distccd-on-servers	\
 	contrib/dmake			\
+	contrib/mirror-build.sh		\
 	contrib/make-j			\
 	contrib/netpwd			\
 	contrib/stage-cc-wrapper.patch	\
