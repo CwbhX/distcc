@@ -2538,6 +2538,21 @@ class MirrorInstalledShadow_Case(MirrorInstalledHarmless_Case,
         MirrorRejected_Case.runtest(self)
 
 
+class MirrorInstalledLater_Case(MirrorInstalledHarmless_Case):
+    """An installed directory searched after the one a header was found in
+    cannot shadow it, so lacking that name there is harmless."""
+    def setup(self):
+        MirrorInstalledHarmless_Case.setup(self)
+        open("inst/sub.h", "w").write("#error not this one\n")
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_HIDE':
+                os.path.abspath("inst") + "/sub.h"}
+    def compileOpts(self):
+        # inc (with sub.h) is searched before inst.
+        return Mirror_Case.compileOpts(self) + \
+            " -I%s -include used.h" % _ShellSafe(os.path.abspath("inst"))
+
+
 class MirrorCompiler_Case(MirrorRejected_Case):
     """A helper whose compiler differs refuses (MIRR 6)."""
     def daemon_env(self):
@@ -2752,6 +2767,7 @@ tests = [
          MirrorShadow_Case,
          MirrorInstalledHarmless_Case,
          MirrorInstalledShadow_Case,
+         MirrorInstalledLater_Case,
          MirrorCompiler_Case,
          MirrorNoConfine_Case,
          MirrorOutsideRoot_Case,

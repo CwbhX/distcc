@@ -189,8 +189,15 @@ int dcc_mirror_rules_from_env(struct dcc_mirror_rules *r, const char *cwd)
             return ret;
         for (i = 0; i < n && !ret; i++) {
             char *eq = strchr(pairs[i], '=');
-            if (eq && eq[1] == '/')
+            if (eq && eq[1] == '/' && pairs[i][0] == '/') {
+                int dummy = r->n_maps;
                 ret = add_str(&r->build_roots, &r->n_build_roots, eq + 1);
+                *eq = '\0';
+                if (!ret)
+                    ret = add_str(&r->map_phys, &dummy, pairs[i]);
+                if (!ret)
+                    ret = add_str(&r->map_logical, &r->n_maps, eq + 1);
+            }
         }
         for (i = 0; i < n; i++)
             free(pairs[i]);
@@ -207,6 +214,23 @@ int dcc_mirror_rules_add(struct dcc_mirror_rules *r, const char *rule)
 {
     if (rule[0] == 'i' && rule[1] == ':' && rule[2] == '/')
         return add_str(&r->installed, &r->n_installed, rule + 2);
+    if (rule[0] == 'p' && rule[1] == ':' && rule[2] == '/') {
+        /* "p:/physical=/logical" */
+        char *copy = strdup(rule + 2), *eq;
+        int ret, dummy = r->n_maps;
+        if (!copy)
+            return EXIT_OUT_OF_MEMORY;
+        if (!(eq = strchr(copy, '=')) || eq[1] != '/') {
+            free(copy);
+            return EXIT_PROTOCOL_ERROR;
+        }
+        *eq = '\0';
+        ret = add_str(&r->map_phys, &dummy, copy);
+        if (!ret)
+            ret = add_str(&r->map_logical, &r->n_maps, eq + 1);
+        free(copy);
+        return ret;
+    }
     if (rule[0] == 'r' && rule[1] == ':' && rule[2] == '/')
         return add_str(&r->roots, &r->n_roots, rule + 2);
     if (rule[0] == 'x' && rule[1] == ':' && rule[2])
@@ -241,6 +265,13 @@ int dcc_mirror_rules_list(const struct dcc_mirror_rules *r, char ***out,
             free(s);
         }
     }
+    for (i = 0; i < r->n_maps && !ret; i++) {
+        char *s;
+        if (asprintf(&s, "p:%s=%s", r->map_phys[i], r->map_logical[i]) < 0)
+            return EXIT_OUT_OF_MEMORY;
+        ret = add_str(out, n, s);
+        free(s);
+    }
     return ret;
 }
 
@@ -258,6 +289,8 @@ void dcc_mirror_rules_free(struct dcc_mirror_rules *r)
     free_strs(r->excludes, r->n_excludes);
     free_strs(r->build_roots, r->n_build_roots);
     free_strs(r->installed, r->n_installed);
+    free_strs(r->map_phys, r->n_maps);
+    free_strs(r->map_logical, r->n_maps);
     free(r->cwd);
     memset(r, 0, sizeof *r);
 }
@@ -279,7 +312,7 @@ static void rules_key(const struct dcc_mirror_rules *r, char out[17])
     snprintf(out, 17, "%016llx", h);
 }
 
-/* @p path made absolute against the logical cwd, lexically. */
+/* @p path made absolute against the logical cwd, not normalized. */
 static char *logical_abs(const struct dcc_mirror_rules *r, const char *path)
 {
     char *s;
@@ -291,6 +324,8 @@ static char *logical_abs(const struct dcc_mirror_rules *r, const char *path)
         return NULL;
     return s;
 }
+
+char *dcc_mirror_normalize(const struct dcc_mirror_rules *r, const char *path);
 
 static int is_under(const char *path, const char *root)
 {
@@ -478,7 +513,9 @@ int dcc_mirror_dir_ident(const char *path, const struct dcc_mirror_rules *r,
         return 0;
     }
     ident->present = DCC_MIRROR_DIR;
-    if (!(abs = logical_abs(r, path)))
+    /* Classify (root, build tree) and key the cache by the normalized
+     * name: ccache's base_dir makes paths like ../../../../Users/x. */
+    if (!(abs = dcc_mirror_normalize(r, path)))
         return EXIT_OUT_OF_MEMORY;
 
     rules_key(r, key_prefix);
@@ -621,6 +658,318 @@ int dcc_mirror_required(char **argv, char **files, int n_files,
             return EXIT_OUT_OF_MEMORY;
         ret = dcc_strset_add(dir_set, d);
         free(d);
+    }
+    return ret;
+}
+
+
+/* ----- search order ----- */
+
+/* @p path made absolute against the logical cwd and normalized lexically
+ * ("//", "/./" and "x/.." collapsed).  Returns a malloc'd string. */
+char *dcc_mirror_normalize(const struct dcc_mirror_rules *r, const char *path)
+{
+    char *abs = logical_abs(r, path), *out, *p, *tok, *save;
+    size_t len;
+
+    if (!abs)
+        return NULL;
+    len = strlen(abs);
+    if (!(out = malloc(len + 2))) {
+        free(abs);
+        return NULL;
+    }
+    out[0] = '\0';
+    for (p = abs; (tok = strsep(&p, "/")) != NULL; ) {
+        if (!*tok || strcmp(tok, ".") == 0)
+            continue;
+        if (strcmp(tok, "..") == 0) {
+            save = strrchr(out, '/');
+            if (save)
+                *save = '\0';
+            continue;
+        }
+        strcat(out, "/");
+        strcat(out, tok);
+    }
+    if (!out[0])
+        strcpy(out, "/");
+    free(abs);
+    /* A physical prefix of the path map names the logical directory. */
+    {
+        int i;
+        for (i = 0; i < r->n_maps; i++) {
+            if (is_under(out, r->map_phys[i])) {
+                char *m;
+                if (asprintf(&m, "%s%s", r->map_logical[i],
+                             out + strlen(r->map_phys[i])) < 0) {
+                    free(out);
+                    return NULL;
+                }
+                free(out);
+                return m;
+            }
+        }
+    }
+    return out;
+}
+
+static int is_under_any(const char *path, char **dirs, int n)
+{
+    int i;
+    for (i = 0; i < n; i++)
+        if (is_under(path, dirs[i]))
+            return 1;
+    return 0;
+}
+
+/**
+ * Daemon side: the file the compiler really opened for @p path.  The
+ * compile runs with the overlay written by dcc_mirror_write_overlay(),
+ * under which clang resolves a path inside a mirror root or a mapped
+ * physical prefix lexically (".." removed, the physical prefix replaced by
+ * its logical name), and any other path through the file system.
+ **/
+char *dcc_mirror_daemon_path(const struct dcc_mirror_rules *r,
+                              char **roots, int n_roots, const char *path)
+{
+    char *norm = dcc_mirror_normalize(r, path);
+
+    if (norm && (is_under_any(norm, roots, n_roots)
+                 || is_under_any(norm, r->map_logical, r->n_maps)))
+        return norm;
+    free(norm);
+    return strdup(path);
+}
+
+/* Quote @p s for the YAML overlay; refuses quotes and newlines. */
+static int yaml_ok(const char *s)
+{
+    return !strpbrk(s, "'\"\n\\");
+}
+
+/**
+ * Write the clang VFS overlay for a mirrored compile: each physical prefix
+ * of the path map is remapped to its logical directory, and each mirror
+ * root to itself, so that paths recorded on the client (a PCH stores its
+ * inputs under the client's physical cwd, e.g.
+ * /Volumes/X/build/../../src/a.h) open the helper's copy.  Names are kept
+ * as spelled, so the .d is the client's own.
+ **/
+int dcc_mirror_write_overlay(const struct dcc_mirror_rules *r,
+                             char **roots, int n_roots, const char *fname)
+{
+    FILE *f;
+    int i, first = 1;
+
+    for (i = 0; i < r->n_maps; i++)
+        if (!yaml_ok(r->map_phys[i]) || !yaml_ok(r->map_logical[i]))
+            return EXIT_PROTOCOL_ERROR;
+    for (i = 0; i < n_roots; i++)
+        if (!yaml_ok(roots[i]))
+            return EXIT_DISTCC_FAILED;
+    if (!(f = fopen(fname, "w")))
+        return EXIT_IO_ERROR;
+    fprintf(f, "{ 'version': 0, 'redirecting-with': 'fallthrough',\n"
+            "  'use-external-names': false,\n  'roots': [\n");
+    for (i = 0; i < r->n_maps; i++) {
+        fprintf(f, "%s    { 'type': 'directory-remap', 'name': '%s',"
+                " 'external-contents': '%s' }", first ? "" : ",\n",
+                r->map_phys[i], r->map_logical[i]);
+        first = 0;
+    }
+    for (i = 0; i < n_roots; i++) {
+        fprintf(f, "%s    { 'type': 'directory-remap', 'name': '%s',"
+                " 'external-contents': '%s' }", first ? "" : ",\n",
+                roots[i], roots[i]);
+        first = 0;
+    }
+    fprintf(f, "\n  ] }\n");
+    return fclose(f) == 0 ? 0 : EXIT_IO_ERROR;
+}
+
+/**
+ * The search directories of argv in the order the preprocessor uses them
+ * for <...> includes (quoted-only -iquote directories first, since they
+ * come before everything for "..." includes): -iquote, -I and -F, -isystem
+ * and -iframework, then -idirafter.  Normalized.
+ **/
+int dcc_mirror_search_order(char **argv, const struct dcc_mirror_rules *r,
+                            char ***dirs_ret, int *n_ret)
+{
+    static const char *const order[][4] = {
+        { "-iquote", NULL },
+        { "-I", "--include-directory", "-F", NULL },
+        { "-isystem", "-iframework", "-iframeworkwithsysroot", NULL },
+        { "-idirafter", "-isystem-after", NULL },
+    };
+    char **dirs = NULL;
+    int n = 0, pass, i, j, ret;
+
+    for (pass = 0; pass < 4; pass++) {
+        for (i = 0; argv[i]; i++) {
+            const char *a = argv[i], *val = NULL;
+            if (strcmp(a, "-Xclang") == 0 || strcmp(a, "-Xpreprocessor") == 0) {
+                i++;
+                continue;
+            }
+            for (j = 0; order[pass][j]; j++) {
+                const char *opt = order[pass][j];
+                size_t len = strlen(opt);
+                if (strcmp(a, opt) == 0) {
+                    val = argv[i + 1];
+                    if (val)
+                        i++;
+                    break;
+                }
+                if (strncmp(a, opt, len) == 0 && a[len]
+                    && (len == 2 || a[len] == '=')) {
+                    val = a + len + (a[len] == '=');
+                    break;
+                }
+            }
+            if (val && *val) {
+                char *norm = dcc_mirror_normalize(r, val);
+                if (!norm || (ret = add_str(&dirs, &n, norm))) {
+                    free(norm);
+                    free_strs(dirs, n);
+                    return norm ? ret : EXIT_OUT_OF_MEMORY;
+                }
+                free(norm);
+            }
+        }
+    }
+    *dirs_ret = dirs;
+    *n_ret = n;
+    return 0;
+}
+
+/* ----- component positions: name -> latest search position ----- */
+
+void dcc_strint_free(struct dcc_strint *m)
+{
+    size_t i;
+    for (i = 0; i < m->cap; i++)
+        free(m->keys[i]);
+    free(m->keys);
+    free(m->vals);
+    memset(m, 0, sizeof *m);
+}
+
+/* Set m[key] = max(m[key], val). */
+static int strint_max(struct dcc_strint *m, const char *key, int val)
+{
+    size_t i;
+
+    if ((m->used + 1) * 2 > m->cap) {
+        size_t ncap = m->cap ? m->cap * 2 : 1024, j;
+        char **nk = calloc(ncap, sizeof *nk);
+        int *nv = calloc(ncap, sizeof *nv);
+        if (!nk || !nv) {
+            free(nk);
+            free(nv);
+            return EXIT_OUT_OF_MEMORY;
+        }
+        for (j = 0; j < m->cap; j++) {
+            if (m->keys[j]) {
+                i = strhash(m->keys[j]) & (ncap - 1);
+                while (nk[i])
+                    i = (i + 1) & (ncap - 1);
+                nk[i] = m->keys[j];
+                nv[i] = m->vals[j];
+            }
+        }
+        free(m->keys);
+        free(m->vals);
+        m->keys = nk;
+        m->vals = nv;
+        m->cap = ncap;
+    }
+    i = strhash(key) & (m->cap - 1);
+    while (m->keys[i]) {
+        if (strcmp(m->keys[i], key) == 0) {
+            if (val > m->vals[i])
+                m->vals[i] = val;
+            return 0;
+        }
+        i = (i + 1) & (m->cap - 1);
+    }
+    if (!(m->keys[i] = strdup(key)))
+        return EXIT_OUT_OF_MEMORY;
+    m->vals[i] = val;
+    m->used++;
+    return 0;
+}
+
+/* m[key], or -1. */
+int dcc_strint_get(const struct dcc_strint *m, const char *key)
+{
+    size_t i;
+
+    if (!m->cap)
+        return -1;
+    i = strhash(key) & (m->cap - 1);
+    while (m->keys[i]) {
+        if (strcmp(m->keys[i], key) == 0)
+            return m->vals[i];
+        i = (i + 1) & (m->cap - 1);
+    }
+    return -1;
+}
+
+static int add_component_positions(struct dcc_strint *m, const char *path,
+                                   int pos)
+{
+    char *copy = strdup(path), *p, *tok;
+    int ret = 0;
+
+    if (!copy)
+        return EXIT_OUT_OF_MEMORY;
+    for (p = copy; !ret && (tok = strsep(&p, "/")) != NULL; ) {
+        size_t len = strlen(tok);
+        if (!len)
+            continue;
+        ret = strint_max(m, tok, pos);
+        if (!ret && len > 10 && strcmp(tok + len - 10, ".framework") == 0) {
+            tok[len - 10] = '\0';
+            ret = strint_max(m, tok, pos);
+        }
+    }
+    free(copy);
+    return ret;
+}
+
+/**
+ * For every path component of the files a job read, the latest position in
+ * the search order (@p dirs, normalized) through which a file containing it
+ * could have been found: the last search directory that is a prefix of the
+ * file, or @p n_dirs if none is (system directories come after all of
+ * them).  A directory at position d can only shadow a file found later, so
+ * a name that differs there matters only if its position is greater than d.
+ * Both the path as written and its normalized form count.
+ **/
+int dcc_mirror_component_positions(char **files, int n_files,
+                                   char **dirs, int n_dirs,
+                                   const struct dcc_mirror_rules *r,
+                                   struct dcc_strint *m)
+{
+    int f, k, ret = 0;
+
+    for (f = 0; f < n_files && !ret; f++) {
+        char *norm = dcc_mirror_normalize(r, files[f]);
+        int pos = n_dirs;
+        if (!norm)
+            return EXIT_OUT_OF_MEMORY;
+        for (k = n_dirs - 1; k >= 0; k--) {
+            if (strcmp(dirs[k], "/") == 0 || is_under(norm, dirs[k])) {
+                pos = k;
+                break;
+            }
+        }
+        ret = add_component_positions(m, files[f], pos);
+        if (!ret)
+            ret = add_component_positions(m, norm, pos);
+        free(norm);
     }
     return ret;
 }

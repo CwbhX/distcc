@@ -135,7 +135,8 @@ static int mirror_tweak_args(char ***argvp, const char *obj_fname,
     char **argv = *argvp, **out;
     int i, n = 0, has_md = 0;
 
-    if (!(out = calloc(dcc_argv_len(argv) + 6, sizeof *out)))
+    /* Room for -MD, -MF <file>, -ivfsoverlay <file> and the NULL. */
+    if (!(out = calloc(dcc_argv_len(argv) + 8, sizeof *out)))
         return EXIT_OUT_OF_MEMORY;
     for (i = 0; argv[i]; i++) {
         const char *a = argv[i];
@@ -218,17 +219,29 @@ static void testing_skew(struct dcc_mirror_ident *ident)
         ident->digest[0] = ident->digest[0] == '0' ? '1' : '0';
 }
 
+/* The file the compiler opened for @p path (see dcc_mirror_daemon_path). */
+static char *opened_path(const struct dcc_mirror_rules *r, const char *path)
+{
+    return dcc_mirror_daemon_path(r, opt_mirror_roots, opt_n_mirror_roots,
+                                  path);
+}
+
 /* Append the DSTA line for file @p path. */
 static int dsta_append(char **buf, size_t *len, size_t *cap,
-                       const char *path)
+                       const char *path, const struct dcc_mirror_rules *r)
 {
     struct dcc_mirror_ident ident;
+    char *opened;
     int ret;
 
     if (testing_hook("DISTCC_TESTING_MIRROR_OMIT", path))
         return 0;
-    if ((ret = dcc_mirror_ident_of(path, dcc_mirror_is_installed_path(path),
-                                   &ident)))
+    if (!(opened = opened_path(r, path)))
+        return EXIT_OUT_OF_MEMORY;
+    ret = dcc_mirror_ident_of(opened, dcc_mirror_is_installed_path(opened),
+                              &ident);
+    free(opened);
+    if (ret)
         return ret;
     if (testing_hook("DISTCC_TESTING_MIRROR_SKEW", path))
         testing_skew(&ident);
@@ -315,12 +328,8 @@ static int dsta_append_dir(char **buf, size_t *len, size_t *cap,
     struct dcc_mirror_ident ident;
     char **names = NULL, *line;
     int n = 0, i, ret, installed;
-    char *abs = NULL;
+    char *abs = dcc_mirror_normalize(r, path);
 
-    if (path[0] == '/')
-        abs = strdup(path);
-    else if (asprintf(&abs, "%s/%s", r->cwd, path) < 0)
-        abs = NULL;
     if (!abs)
         return EXIT_OUT_OF_MEMORY;
     installed = dcc_mirror_is_installed_path(abs);
@@ -328,9 +337,16 @@ static int dsta_append_dir(char **buf, size_t *len, size_t *cap,
 
     if (testing_hook("DISTCC_TESTING_MIRROR_OMIT", path))
         return 0;
-    if ((ret = dcc_mirror_dir_ident(path, r, &ident,
-                                    installed ? &names : NULL, &n)))
-        return ret;
+    {
+        char *opened = opened_path(r, path);
+        if (!opened)
+            return EXIT_OUT_OF_MEMORY;
+        ret = dcc_mirror_dir_ident(opened, r, &ident,
+                                   installed ? &names : NULL, &n);
+        free(opened);
+        if (ret)
+            return ret;
+    }
     if (testing_hook("DISTCC_TESTING_MIRROR_SKEW", path))
         testing_skew(&ident);
     {
@@ -553,9 +569,16 @@ int dcc_mirror_serve(int in_fd, int out_fd,
     for (i = 0; i < (unsigned) checks.n; i++) {
         struct dcc_mirror_ident here;
         const struct dcc_mirror_check *c = &checks.items[i];
+        char *opened;
         if (dcc_mirror_is_installed_path(c->path))
             continue;
-        if ((ret = dcc_mirror_ident_of(c->path, 0, &here)))
+        if (!(opened = opened_path(&rules, c->path))) {
+            ret = EXIT_OUT_OF_MEMORY;
+            goto out;
+        }
+        ret = dcc_mirror_ident_of(opened, 0, &here);
+        free(opened);
+        if (ret)
             goto out;
         if (!dcc_mirror_ident_equal(&c->ident, &here, 0))
             REFUSE(DCC_MIRR_STALE, "%s differs from the client's copy",
@@ -578,6 +601,27 @@ int dcc_mirror_serve(int in_fd, int out_fd,
     }
     if ((ret = mirror_tweak_args(&argv, obj_fname, dotd_fname)))
         goto out;
+    /* Let clang open paths the client recorded under its physical cwd. */
+    {
+        char *vfs;
+        if (asprintf(&vfs, "%s/vfs.yaml", job_dir) < 0) {
+            ret = EXIT_OUT_OF_MEMORY;
+            goto out;
+        }
+        ret = dcc_mirror_write_overlay(&rules, opt_mirror_roots,
+                                       opt_n_mirror_roots, vfs);
+        if (!ret) {
+            ret = dcc_argv_append(argv, strdup("-ivfsoverlay"));
+            if (!ret)
+                ret = dcc_argv_append(argv, vfs);
+            else
+                free(vfs);
+        } else {
+            free(vfs);
+        }
+        if (ret)
+            goto out;
+    }
 
     if (getenv("TMPDIR"))
         saved_tmpdir = strdup(getenv("TMPDIR"));
@@ -631,7 +675,7 @@ int dcc_mirror_serve(int in_fd, int out_fd,
         for (k = 0; k < file_set.cap; k++)
             if (file_set.items[k]
                 && (ret = dsta_append(&dsta, &dsta_len, &dsta_cap,
-                                      file_set.items[k])))
+                                      file_set.items[k], &rules)))
                 goto out;
         for (k = 0; k < dir_set.cap; k++)
             if (dir_set.items[k]

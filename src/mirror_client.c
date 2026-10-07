@@ -56,6 +56,7 @@ static const char *const harmless_pch_options[] = {
     "-fno-pch-timestamp",
     "-fpch-validate-input-files-content",
     "-fno-pch-validate-input-files-content",
+    "-fpch-preprocess",         /* added by ccache; only affects -E */
     NULL
 };
 
@@ -398,20 +399,57 @@ struct pending_listing {
     int active;
 };
 
+/* What deciding about a differing installed directory needs; the search
+ * order and component positions are only computed if one differs. */
+struct listing_ctx {
+    char **argv;
+    char **files;
+    int n_files;
+    int ready;
+    char **dirs;
+    int n_dirs;
+    struct dcc_strint positions;
+};
+
+static void listing_ctx_free(struct listing_ctx *c)
+{
+    int i;
+    for (i = 0; i < c->n_dirs; i++)
+        free(c->dirs[i]);
+    free(c->dirs);
+    dcc_strint_free(&c->positions);
+}
+
+/* Does an entry named @p name, present on one side only, matter for a
+ * directory at search position @p d (-1: not a search directory)? */
+static int name_matters(struct listing_ctx *c, int d, const char *name)
+{
+    int p = dcc_strint_get(&c->positions, name);
+
+    if (p < 0)
+        return 0;           /* no path the compile read goes through it */
+    if (d < 0)
+        return 1;           /* includer directory: searched first */
+    return p > d;           /* could have been found here first */
+}
+
 /**
  * An installed directory differs from the helper's copy.  Accept it if no
- * entry present on only one side (or of a different kind) is named like a
- * component of a path the compile read.
+ * entry present on only one side (or of a different kind) could have
+ * changed what a path the compile read resolved to: its name must be a
+ * component of such a path, and the directory must be searched before the
+ * directory that path could have been found through.
  **/
 static int listing_acceptable(struct dcc_mirror_job *job,
                               struct pending_listing *pl,
-                              const struct dcc_strset *comps)
+                              struct listing_ctx *c)
 {
     char **local;
-    int n_local, i, ok = 1;
+    int n_local, i, ok = 1, d = -1;
     struct dcc_mirror_ident id;
     struct dcc_strset local_set = { NULL, 0, 0 };
     size_t k;
+    char *norm;
 
     if (dcc_mirror_dir_ident(pl->path, &job->rules, &id, &local, &n_local)
         || id.present != DCC_MIRROR_DIR)
@@ -420,11 +458,34 @@ static int listing_acceptable(struct dcc_mirror_job *job,
         dcc_mirror_free_names(local, n_local);
         return 1;
     }
+    if (!c->ready) {
+        if (dcc_mirror_search_order(c->argv, &job->rules, &c->dirs,
+                                    &c->n_dirs)
+            || dcc_mirror_component_positions(c->files, c->n_files, c->dirs,
+                                              c->n_dirs, &job->rules,
+                                              &c->positions)) {
+            dcc_mirror_free_names(local, n_local);
+            return 0;
+        }
+        c->ready = 1;
+    }
+    if (!(norm = dcc_mirror_normalize(&job->rules, pl->path))) {
+        dcc_mirror_free_names(local, n_local);
+        return 0;
+    }
+    for (i = 0; i < c->n_dirs; i++) {
+        if (strcmp(c->dirs[i], norm) == 0) {
+            d = i;
+            break;
+        }
+    }
+    free(norm);
+
     for (i = 0; i < n_local && ok; i++) {
         if (dcc_strset_add(&local_set, local[i]))
             ok = 0;
         else if (!dcc_strset_has(&pl->names, local[i])
-                 && dcc_strset_has(comps, local[i] + 1)) {
+                 && name_matters(c, d, local[i] + 1)) {
             rs_log_info("mirror: %s/%s exists only here", pl->path,
                         local[i] + 1);
             ok = 0;
@@ -432,7 +493,8 @@ static int listing_acceptable(struct dcc_mirror_job *job,
     }
     for (k = 0; k < pl->names.cap && ok; k++) {
         const char *e = pl->names.items[k];
-        if (e && !dcc_strset_has(&local_set, e) && dcc_strset_has(comps, e + 1)) {
+        if (e && !dcc_strset_has(&local_set, e)
+            && name_matters(c, d, e + 1)) {
             rs_log_info("mirror: %s/%s exists only on the helper", pl->path,
                         e + 1);
             ok = 0;
@@ -471,10 +533,12 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
     struct dcc_strset comps = { NULL, 0, 0 };
     struct dcc_strset seen_files = { NULL, 0, 0 }, seen_dirs = { NULL, 0, 0 };
     struct pending_listing pl;
+    struct listing_ctx lctx;
     char *line, *next, *end = dsta + dsta_len;
     size_t k;
 
     memset(&pl, 0, sizeof pl);
+    memset(&lctx, 0, sizeof lctx);
     *first_mismatch = NULL;
     if (dotd_len && (ret = dcc_mirror_parse_dotd(dotd_text, dotd_len,
                                                  &dotd_paths, &n_dotd)))
@@ -491,6 +555,9 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
     if ((ret = dcc_mirror_required(argv, files, n_files, &file_set,
                                    &dir_set, &comps)))
         goto out;
+    lctx.argv = argv;
+    lctx.files = files;
+    lctx.n_files = n_files;
 
 #define MISMATCH(p) do { ret = EXIT_DISTCC_FAILED; \
         if (!*first_mismatch) *first_mismatch = strdup(p); goto out; } while (0)
@@ -516,7 +583,7 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
             continue;
         }
         if (pl.active) {
-            if (!listing_acceptable(job, &pl, &comps))
+            if (!listing_acceptable(job, &pl, &lctx))
                 MISMATCH(pl.path);
             pending_reset(&pl);
         }
@@ -564,7 +631,7 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
         }
     }
     if (pl.active) {
-        if (!listing_acceptable(job, &pl, &comps))
+        if (!listing_acceptable(job, &pl, &lctx))
             MISMATCH(pl.path);
         pending_reset(&pl);
     }
@@ -591,6 +658,7 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
 
   out:
     pending_reset(&pl);
+    listing_ctx_free(&lctx);
     free(files);
     dcc_mirror_free_paths(dotd_paths, n_dotd);
     dcc_strset_free(&file_set);

@@ -119,6 +119,9 @@ struct dcc_mirror_rules {
     int n_build_roots;
     char **installed;       /* installed-tree prefixes the client uses */
     int n_installed;
+    char **map_phys;        /* DISTCC_MIRROR_PATHMAP: physical prefixes */
+    char **map_logical;     /* ... and the logical names they map to */
+    int n_maps;
     char *cwd;              /* logical cwd, for relative paths */
 };
 int dcc_mirror_rules_from_env(struct dcc_mirror_rules *r, const char *cwd);
@@ -137,6 +140,24 @@ int dcc_mirror_required(char **argv, char **files, int n_files,
                         struct dcc_strset *file_set,
                         struct dcc_strset *dir_set,
                         struct dcc_strset *comps);
+struct dcc_strint {
+    char **keys;
+    int *vals;
+    size_t cap, used;
+};
+void dcc_strint_free(struct dcc_strint *m);
+int dcc_strint_get(const struct dcc_strint *m, const char *key);
+char *dcc_mirror_normalize(const struct dcc_mirror_rules *r, const char *path);
+int dcc_mirror_search_order(char **argv, const struct dcc_mirror_rules *r,
+                            char ***dirs_ret, int *n_ret);
+int dcc_mirror_component_positions(char **files, int n_files,
+                                   char **dirs, int n_dirs,
+                                   const struct dcc_mirror_rules *r,
+                                   struct dcc_strint *m);
+char *dcc_mirror_daemon_path(const struct dcc_mirror_rules *r,
+                              char **roots, int n_roots, const char *path);
+int dcc_mirror_write_overlay(const struct dcc_mirror_rules *r,
+                             char **roots, int n_roots, const char *fname);
 int dcc_mirror_compiler_ident(const char *argv0,
                               char hex[DCC_SHA256_HEX_LEN + 1]);
 extern const char *const dcc_mirror_env_names[];
