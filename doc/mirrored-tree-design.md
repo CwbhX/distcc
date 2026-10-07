@@ -70,11 +70,17 @@ PCH/non-PCH ratio matches the host's.
 
 ## Facts about the environment that shape the design
 
-- **Compilers differ today.** Host: clang-2100.3.33.1. M6: clang-2100.3.34.2.
-  Clang refuses a PCH written by a different compiler build, so mirrored PCH
-  jobs fail on the M6 until both Command Line Tools match. Tested on the M6
-  on 2026-10-06: `error: PCH file '...' built from a different branch
-  ((clang-2100.3.33.1)) than the compiler ((clang-2100.3.34.2))`.
+- **Compilers must match.** Clang refuses a PCH written by a different
+  compiler build. On 2026-10-06 the host had clang-2100.3.33.1 and the M6
+  clang-2100.3.34.2, and the M6 failed with `error: PCH file '...' built
+  from a different branch ((clang-2100.3.33.1)) than the compiler
+  ((clang-2100.3.34.2))`. On 2026-10-07 the host got Command Line Tools for
+  Xcode 27.0 (clang-2100.3.34.2; both Macs on macOS 27.0.1, 26A434). The
+  host's older CLT had no package receipt, so Software Update offered the
+  new one only after creating
+  `/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress`. Since
+  then a PCH built on the host and copied with `rsync -a` loads on the M6,
+  and both Macs produce byte-identical `.o` and `.d` from it.
 - **Physical vs logical cwd.** `~/Git/Ohmly/build-dev` is a symlink to
   `/Volumes/ExternalSSD/Developer/Ohmly/build-dev`. `dcc_x_cwd`
   (`src/clirpc.c:95`) sends `getcwd()`, which is the physical path. The M6 has
@@ -110,7 +116,9 @@ PCH/non-PCH ratio matches the host's.
   created them at a different time; their targets match. Before the kegs
   were copied, all 3401 common `MacOSX27.0.sdk` headers differed in mtime
   and 5 differed in content although both Macs report the same SDK
-  version.
+  version. After the CLT update on 2026-10-07 all 6984 match in size, mtime
+  (symlinks followed) and content. Installed trees are still checked by
+  digest, since the next update on either Mac can break that again.
 - **ccache runs in depend mode** (`depend_mode = true`): it never runs cpp
   itself and builds its manifest from the `.d` file the compile writes. A
   mirrored job must therefore return the real `.d` to the client's `-MF`
@@ -404,8 +412,8 @@ scope. Any header change that rebuilds a PCH costs one 40–113 MB copy
 
 ## Failure modes
 
-- **Compiler mismatch** (true today). Every PCH job fails remotely and
-  retries locally: a slow pool. Mitigation: match Command Line Tools first.
+- **Compiler mismatch** (the state until 2026-10-07). Every PCH job fails
+  remotely and retries locally: a slow pool. Mitigation: match Command Line Tools first.
   A later `CVER` token (cached `clang --version` per compiler path) would let
   the daemon answer `MIRR` instead of wasting a compile.
 - **Sync forgotten or racing with edits.** Pre-check and post-check send the
@@ -439,9 +447,10 @@ scope. Any header change that rebuilds a PCH costs one 40–113 MB copy
    `sandbox-exec` confinement of a real compile (writes to the mirror,
    `$HOME` and `/tmp`, `-Wp,-MD,<mirror>`, `-save-temps=cwd` and `-o
    <mirror>` all denied; a malformed profile makes `sandbox-exec` exit 65
-   without running anything), and the PCH version error. Still open: CLT
-   versions, the `ExternalSSD` volume and source tree on the M6, and the
-   one-TU proof itself.
+   without running anything), the PCH version error, and (2026-10-07,
+   after matching CLT) a host-built PCH loading on the M6 with
+   byte-identical output. Still open: the `ExternalSSD` volume and source
+   tree on the M6, and the one-TU proof itself.
 1. **Mirror protocol with complete post-check, write confinement and local
    fallback.**
    `src/distcc.h` (`DCC_CPP_MIRROR`, `DCC_VER_4`); `src/hosts.c`
