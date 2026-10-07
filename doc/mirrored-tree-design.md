@@ -83,9 +83,13 @@ PCH/non-PCH ratio matches the host's.
   physical cwd (`-o pcbnew/CMakeFiles/...`), and ccache's
   `base_dir=/Users/clementhathaway/Git` may turn absolute paths into relative
   ones. The mirror must therefore reproduce **both** paths: the same symlink
-  at `~/Git/Ohmly/build-dev`, and the same physical target. On the M6 that
-  most simply means an APFS volume named `ExternalSSD` (it mounts at
-  `/Volumes/ExternalSSD`; creating it may need admin rights).
+  at `~/Git/Ohmly/build-dev`, and the same physical target. The M6 has no
+  external drive, so that most simply means an APFS volume named
+  `ExternalSSD` on its internal disk (`diskutil apfs addVolume disk3 APFS
+  ExternalSSD`; it shares the container's free space and mounts at
+  `/Volumes/ExternalSSD`; creating it needs admin rights). A root-owned
+  symlink `/Volumes/ExternalSSD` to a directory in the home folder would also
+  do, and needs `sudo` too.
 - **External headers.** ninja's deps log for `build-dev` lists 6984 distinct
   external headers: 2783 from `MacOSX26.5.sdk`, 34 clang builtins, 3596 from
   17 Homebrew formulae (abseil 20260107.1, boost 1.90.0_1, cairo 1.18.4,
