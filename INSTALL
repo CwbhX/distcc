@@ -16,6 +16,10 @@ QUICK SUMMARY
 
       sudo apt-get install gcc make python3 python3-dev python3-setuptools autoconf pkg-config libpopt-dev
 
+   or on macOS with Homebrew (and the Xcode command line tools)
+
+      brew install autoconf automake pkgconf popt python-setuptools
+
 1. Build and install
 
       ./autogen.sh              # If "configure" does not already exist.
@@ -66,6 +70,14 @@ It is also highly desirable to have
 If you have any version of Python installed, then you need to have
 the corresponding Python.h file installed (e.g. sudo apt-get install python-dev).
 
+Building the include server for "pump" mode also needs the Python
+setuptools module for that same Python (e.g. sudo apt-get install
+python3-setuptools).  If setuptools cannot be imported, configure
+leaves pump mode out with a warning, or stops with an error when
+--enable-pump-mode was given explicitly.  If you do not want pump mode,
+configure with --disable-pump-mode; then neither the include server nor
+the "pump" script is built or installed, and setuptools is not needed.
+
 You can optionally have
 
    linuxdoc SGML tools
@@ -76,9 +88,24 @@ You can optionally have
 
      To rebuild the configure scripts if you edit configure.ac.
 
-   pkg-config
+   pkg-config (or pkgconf)
 
-     To find the libpopt library in the configure script.
+     To find the libpopt library in the configure script.  configure
+     uses PKG_CHECK_MODULES for this, so in practice pkg-config is needed
+     unless you set POPT_CFLAGS and POPT_LIBS yourself.
+
+On macOS, the system provides neither libpopt nor pkg-config.  With
+Homebrew, install them with
+
+   brew install pkgconf popt
+
+The Python 3 that Homebrew installs does not include setuptools, so
+for pump mode either also run "brew install python-setuptools", use the
+Xcode command line tools' Python (which has it) with
+"PYTHON=/usr/bin/python3 ./configure", or configure with
+--disable-pump-mode.  Homebrew installs into /opt/homebrew
+on Apple Silicon, so make sure /opt/homebrew/bin is on your PATH when
+running ./autogen.sh and ./configure.
 
 To build the optional GNOME monitor (--with-gnome), you need the
 GNOME2 development libraries, and in particular
