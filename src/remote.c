@@ -426,6 +426,7 @@ int dcc_compile_mirror(char **argv,
     if (gettimeofday(&before, NULL))
         rs_log_warning("gettimeofday failed");
 
+    job.argv = argv;
     if (dcc_mirror_prepare(argv, input_fname, &job) != 0) {
         rs_trace("job not mirrorable; using the classic path");
         ret = 0;
@@ -468,6 +469,17 @@ int dcc_compile_mirror(char **argv,
         goto out;
     }
     if (verify_failed) {
+        *status = 0;
+        goto out;
+    }
+    if (*status != 0) {
+        /* The compile failed in the mirror.  That may be the mirror's
+         * fault (a file missing there), so redo it the classic way on the
+         * same host instead of blaming the host; a real error fails there
+         * too and is then retried locally as usual. */
+        rs_log(RS_LOG_INFO|RS_LOG_NONAME,
+               "mirror: compile of %s failed on %s; using the classic path",
+               input_fname, host->hostname);
         *status = 0;
         goto out;
     }

@@ -149,7 +149,7 @@ pkgdoc_DOCS = AUTHORS COPYING NEWS \
 	TODO \
 	doc/protocol-1.txt doc/status-1.txt \
 	doc/protocol-2.txt \
-	doc/protocol-3.txt doc/protocol-3-impl.txt \
+	doc/protocol-3.txt doc/protocol-3-impl.txt doc/protocol-4.txt \
 	doc/protocol-gssapi.txt \
 	doc/reporting-bugs.txt
 
@@ -241,7 +241,8 @@ common_obj = src/arg.o src/argutil.o					\
 	src/sendfile.o							\
 	src/safeguard.o src/snprintf.o src/timeval.o			\
 	src/dotd.o 							\
-	src/mirror.o src/mirror_digest.o src/sha256.o			\
+	src/mirror.o src/mirror_digest.o src/mirror_ident.o		\
+	src/sha256.o							\
 	src/hosts.o src/hostfile.o					\
 	src/implicit.o src/loadfile.o					\
 	lzo/minilzo.o                                                   \
@@ -331,6 +332,7 @@ SRC =	src/stats.c							\
 	src/h_sa2str.c src/h_scanargs.c src/h_strip.c			\
 	src/h_dotd.c src/h_compile.c src/h_getline.c			\
 	src/h_mirror.c src/mirror.c src/mirror_digest.c src/sha256.c	\
+	src/mirror_ident.c						\
 	src/confine.c src/mirror_client.c src/mirror_serve.c		\
 	src/help.c src/history.c src/hosts.c src/hostfile.c		\
 	src/implicit.c src/io.c						\

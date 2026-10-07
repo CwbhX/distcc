@@ -251,7 +251,8 @@ int dcc_confine_probe(void)
         _exit(errno == EPERM || errno == EACCES ? 0 : 5);
     }
     if (waitpid(pid, &status, 0) == pid && WIFEXITED(status)
-        && WEXITSTATUS(status) == 0 && access(outside, F_OK) == -1)
+        && WEXITSTATUS(status) == 0 && access(outside, F_OK) == -1
+        && !getenv("DISTCC_TESTING_CONFINE_PROBE_FAIL"))
         ret = 0;
     else
         rs_log_error("write confinement probe failed (status %d)", status);

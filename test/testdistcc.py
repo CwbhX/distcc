@@ -2307,6 +2307,376 @@ class Getline_Case(comfychair.TestCase):
                 self.assert_equal(msg_parts[4], " rest = '%s'\n" % rest);
 
 # All the tests defined in this suite
+
+class MirrorHelper_Case(SimpleDistCC_Case):
+    """Unit checks of the mirror-mode helpers through h_mirror."""
+    def runtest(self):
+        open("abc", "w").write("abc")
+        out, err = self.runcmd("h_mirror sha256 abc")
+        self.assert_equal(out.strip(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+        open("t.d", "w").write("t.o: a\\ b/sp\\ ace.h h\\#ash.h d$$ollar.h \\\n"
+                               "  co:lon.h last.h\n"
+                               "a\\ b/sp\\ ace.h:\n")
+        out, err = self.runcmd("h_mirror dotd t.d")
+        self.assert_equal(out,
+            "a b/sp ace.h\nh#ash.h\nd$ollar.h\nco:lon.h\nlast.h\n")
+        out, err = self.runcmd("h_mirror dsta 'F 3 17 - /a b/c'")
+        self.assert_equal(out, "F 3 17 - /a b/c\n")
+        out, err = self.runcmd("h_mirror dsta 'F x 17 - /a'")
+        self.assert_equal(out, "invalid\n")
+        out, err = self.runcmd("h_mirror dsta 'D " + "0" * 64 + " /d'")
+        self.assert_equal(out, "D " + "0" * 64 + " /d\n")
+
+
+class Mirror_Case(Compilation_Case):
+    """Compile in a mirrored tree: the daemon compiles the client's own
+    files in place (on localhost both sides share one tree).
+
+    Subclasses set daemon_env() to the daemon's test hooks and check how
+    the job went with mirror_expect()."""
+
+    def setup(self):
+        self.mirror_root = os.getcwd()
+        f = open("cmdlist", "w")
+        f.write(self._cc_path() + "\n")
+        f.close()
+        self.cmdlist = os.path.abspath("cmdlist")
+        Compilation_Case.setup(self)
+
+    def _cc_path(self):
+        self.initCompiler()
+        return os.path.realpath(self._cc) if os.path.islink(self._cc) \
+            else self._cc
+
+    def daemon_env(self):
+        return {}
+
+    def daemon_extra_options(self):
+        return ""
+
+    def startDaemon(self):
+        saved = {}
+        # The command list stands in for the masquerade whitelist, so the
+        # test compiler is allowed and no installed whitelist is needed.
+        env = dict(self.daemon_env())
+        env['DISTCC_CMDLIST'] = self.cmdlist
+        for k, v in env.items():
+            saved[k] = os.environ.get(k)
+            os.environ[k] = v
+        try:
+            WithDaemon_Case.startDaemon(self)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    del os.environ[k]
+                else:
+                    os.environ[k] = v
+
+    def daemon_command(self):
+        return (self.distccd() +
+                "--verbose --lifetime=%d --daemon --log-file %s "
+                "--pid-file %s --port %d --allow 127.0.0.1 "
+                "--mirror-root %s %s"
+                % (self.daemon_lifetime(),
+                   _ShellSafe(self.daemon_logfile),
+                   _ShellSafe(self.daemon_pidfile),
+                   self.server_port,
+                   _ShellSafe(self.mirror_root),
+                   self.daemon_extra_options()))
+
+    def setupEnv(self):
+        WithDaemon_Case.setupEnv(self)
+        os.environ['DISTCC_HOSTS'] = '127.0.0.1:%d,mirror' % self.server_port
+        os.environ['DISTCC_MIRROR_ROOTS'] = self.mirror_root
+
+    def headerSource(self):
+        return '#define HELLO_WORLD "hello mirror"\n'
+
+    def source(self):
+        return """
+#include <stdio.h>
+#include "%s"
+#include "sub.h"
+int main(void) {
+    puts(HELLO_WORLD PCHTEXT SUBTEXT);
+    return 0;
+}
+""" % self.headerFilename()
+
+    def createSource(self):
+        Compilation_Case.createSource(self)
+        os.mkdir("inc")
+        open("inc/sub.h", "w").write('#define SUBTEXT ""\n')
+        open("pch.h", "w").write('#define PCHTEXT ""\n')
+        self.runcmd(self._cc + " -x c-header pch.h -o pch.h.pch")
+
+    def compileOpts(self):
+        return ("-Iinc -Xclang -include-pch -Xclang pch.h.pch "
+                "-MD -MT testtmp.o -MF testtmp.d")
+
+    def compileCmd(self):
+        return "DISTCC_FALLBACK=1 " + self.distcc() + \
+               self._cc + " -o testtmp.o " + self.compileOpts() + \
+               " -c %s" % (self.sourceFilename())
+
+    def checkBuiltProgramMsgs(self, msgs):
+        self.assert_equal(msgs, "hello mirror\n")
+
+    def client_log(self):
+        return open(os.environ['DISTCC_LOG']).read()
+
+    def mirror_expect(self, log):
+        self.assert_re_search("compiled in the mirror", log)
+
+    def runtest(self):
+        self.compile()
+        self.link()
+        self.checkBuiltProgram()
+        log = self.client_log()
+        self.mirror_expect(log)
+        # The .d is the compiler's own, as a local compile would write it.
+        self.runcmd(self._cc + " -o local.o " + self.compileOpts().replace(
+            "testtmp.d", "local.d") + " -c " + self.sourceFilename())
+        self.assert_equal(open("testtmp.d").read(), open("local.d").read())
+
+
+class MirrorRejected_Case(Mirror_Case):
+    """A mismatch reported by the daemon sends the job the classic way;
+    the object still comes out right."""
+    def mirror_expect(self, log):
+        self.assert_re_search(self.expected_reason(), log)
+        self.assert_re_search("using the classic path|not using the remote",
+                              log)
+        if re.search("compiled in the mirror", log):
+            self.fail("job was accepted from the mirror:\n" + log)
+
+    def runtest(self):
+        self.compile()
+        self.link()
+        self.checkBuiltProgram()
+        self.mirror_expect(self.client_log())
+
+
+class MirrorStalePch_Case(MirrorRejected_Case):
+    """The helper's PCH differs (stale PCH): rejected."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_SKEW': 'pch.h.pch'}
+    def expected_reason(self):
+        return "pch.h.pch differs from the helper's copy"
+
+
+class MirrorStaleHeader_Case(MirrorRejected_Case):
+    """The helper's copy of a header has another mtime (same-size edit):
+    rejected."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_SKEW': 'inc/sub.h'}
+    def expected_reason(self):
+        return "inc/sub.h differs from the helper's copy"
+
+
+class MirrorOmittedFile_Case(MirrorRejected_Case):
+    """A daemon that leaves a file out of DSTA is not trusted."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_OMIT': 'inc/sub.h'}
+    def expected_reason(self):
+        return "did not describe file inc/sub.h"
+
+
+class MirrorOmittedDir_Case(MirrorRejected_Case):
+    """A daemon that leaves a search directory out of DSTA is not trusted."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_OMIT': 'inc'}
+    def expected_reason(self):
+        return "did not describe directory inc"
+
+
+class MirrorShadow_Case(MirrorRejected_Case):
+    """A search directory whose entries differ (a header that could shadow
+    another) is rejected."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_SKEW': 'inc'}
+    def expected_reason(self):
+        return "inc differs from the helper's copy"
+
+
+class MirrorInstalledHarmless_Case(Mirror_Case):
+    """An installed directory may lack entries no path was spelled through."""
+    def setup(self):
+        os.mkdir("inst")
+        open("inst/used.h", "w").write("#define USED 1\n")
+        open("inst/zzz_unused.h", "w").write("#define UNUSED 1\n")
+        Mirror_Case.setup(self)
+    def setupEnv(self):
+        Mirror_Case.setupEnv(self)
+        os.environ['DISTCC_MIRROR_INSTALLED'] = (
+            os.path.abspath("inst") + ":/Library/Developer/CommandLineTools"
+            ":/opt/homebrew:/usr/include")
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_HIDE':
+                os.path.abspath("inst") + "/zzz_unused.h"}
+    def compileOpts(self):
+        return "-I%s -include used.h " % _ShellSafe(os.path.abspath("inst")) \
+            + Mirror_Case.compileOpts(self)
+    def runtest(self):
+        self.compile()
+        self.link()
+        self.checkBuiltProgram()
+        self.mirror_expect(self.client_log())
+
+
+class MirrorInstalledShadow_Case(MirrorInstalledHarmless_Case,
+                                 MirrorRejected_Case):
+    """An installed directory lacking an entry that a path was spelled
+    through is rejected."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_HIDE':
+                os.path.abspath("inst") + "/used.h"}
+    def expected_reason(self):
+        return "used.h exists only here"
+    def runtest(self):
+        MirrorRejected_Case.runtest(self)
+
+
+class MirrorCompiler_Case(MirrorRejected_Case):
+    """A helper whose compiler differs refuses (MIRR 6)."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_CVER': '1'}
+    def expected_reason(self):
+        return "MIRR 6"
+
+
+class MirrorNoConfine_Case(MirrorRejected_Case):
+    """If the compiler cannot be confined the daemon refuses (MIRR 5)."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_NO_CONFINE': '1'}
+    def expected_reason(self):
+        return "MIRR 5"
+
+
+class MirrorOutsideRoot_Case(MirrorRejected_Case):
+    """A cwd outside every --mirror-root is refused (MIRR 1)."""
+    def setup(self):
+        Mirror_Case.setup(self)
+    def daemon_command(self):
+        os.mkdir(os.path.join(self.mirror_root, "elsewhere"))
+        self.mirror_root = os.path.join(self.mirror_root, "elsewhere")
+        return Mirror_Case.daemon_command(self)
+    def setupEnv(self):
+        Mirror_Case.setupEnv(self)
+        del os.environ['DISTCC_MIRROR_ROOTS']
+    def expected_reason(self):
+        return "MIRR 1"
+
+
+class MirrorEnv_Case(Mirror_Case):
+    """Environment that changes what the compiler reads is forwarded."""
+    def setupEnv(self):
+        Mirror_Case.setupEnv(self)
+        os.environ['CPATH'] = os.path.abspath("cpathdir")
+    def createSource(self):
+        Mirror_Case.createSource(self)
+        os.mkdir("cpathdir")
+        open("cpathdir/fromcpath.h", "w").write("#define FROMCPATH 1\n")
+        open(self.sourceFilename(), "a").write(
+            '#include "fromcpath.h"\n#if !FROMCPATH\n#error\n#endif\n')
+    def teardown(self):
+        os.environ.pop('CPATH', None)
+        Mirror_Case.teardown(self)
+    def runtest(self):
+        self.compile()
+        self.link()
+        self.checkBuiltProgram()
+        self.mirror_expect(self.client_log())
+
+
+class MirrorPathmap_Case(Mirror_Case):
+    """The cwd is sent under its mapped (logical) name."""
+    def setup(self):
+        Mirror_Case.setup(self)
+        os.symlink(self.mirror_root, "logical")
+    def setupEnv(self):
+        Mirror_Case.setupEnv(self)
+        os.environ['DISTCC_MIRROR_PATHMAP'] = "%s=%s" % (
+            os.path.realpath(self.mirror_root),
+            os.path.join(self.mirror_root, "logical"))
+        os.environ['DISTCC_MIRROR_ROOTS'] = self.mirror_root
+    def mirror_expect(self, log):
+        Mirror_Case.mirror_expect(self, log)
+        self.assert_re_search("logical", open(self.daemon_logfile).read())
+    def runtest(self):
+        self.compile()
+        self.link()
+        self.checkBuiltProgram()
+        self.mirror_expect(self.client_log())
+
+
+class MirrorBadPathmap_Case(MirrorRejected_Case):
+    """A path map that names another directory is not used."""
+    def setupEnv(self):
+        Mirror_Case.setupEnv(self)
+        os.mkdir("other")
+        os.environ['DISTCC_MIRROR_PATHMAP'] = "%s=%s" % (
+            os.path.realpath(self.mirror_root),
+            os.path.join(self.mirror_root, "other"))
+    def expected_reason(self):
+        return "is not the same directory"
+    def mirror_expect(self, log):
+        self.assert_re_search(self.expected_reason(), log)
+
+
+class MirrorConfined_Case(Mirror_Case):
+    """The compiler may only write in its job directory."""
+    def setup(self):
+        Mirror_Case.setup(self)
+    def _cc_path(self):
+        self.initCompiler()
+        real = os.path.realpath(self._cc)
+        self.outside = [os.path.join(os.getcwd(), "written_in_mirror"),
+                        os.getcwd() + "_written_outside"]
+        script = os.path.join(os.getcwd(), "writecc")
+        f = open(script, "w")
+        # Only the compile of testtmp.c tries to write; not the local PCH
+        # build or link, and not a classic-path compile of a .i file.
+        f.write("#!/bin/sh\n"
+                "case \"$*\" in *.i\\ *|*.i|*-x\\ c-header*) ;; "
+                "*testtmp.c*)\n")
+        for path in self.outside:
+            f.write("  { echo x > '%s'; } 2>/dev/null\n" % path)
+        f.write("  ;; esac\nexec '%s' \"$@\"\n" % real)
+        f.close()
+        os.chmod(script, 0o755)
+        self._cc = script
+        return script
+    def initCompiler(self):
+        if not hasattr(self, '_cc') or not self._cc.endswith("writecc"):
+            Mirror_Case.initCompiler(self)
+    def runtest(self):
+        self.compile()
+        self.link()
+        self.checkBuiltProgram()
+        self.mirror_expect(self.client_log())
+        for path in self.outside:
+            if os.path.exists(path):
+                self.fail("confined compiler wrote %s" % path)
+
+
+class MirrorStartRefused_Case(SimpleDistCC_Case):
+    """--mirror-root refuses to start with --enable-tcp-insecure, or when
+    the confinement probe fails."""
+    def runtest(self):
+        base = (self.distccd() + "--daemon --no-detach --port 0 "
+                "--allow 127.0.0.1 --log-stderr --mirror-root . ")
+        result, out, err = self.runcmd_unchecked(base + "--enable-tcp-insecure")
+        self.assert_notequal(result, 0)
+        self.assert_re_search("cannot be combined", err)
+        result, out, err = self.runcmd_unchecked(
+            "DISTCC_CMDLIST=/dev/null DISTCC_TESTING_CONFINE_PROBE_FAIL=1 "
+            + base)
+        self.assert_notequal(result, 0)
+        self.assert_re_search("needs write confinement", err)
+
+
 tests = [
          CompileHello_Case,
          CommaInFilename_Case,
@@ -2373,6 +2743,23 @@ tests = [
          AbsSourceFilename_Case,
          Getline_Case,
          Unicode_Case,
+         MirrorHelper_Case,
+         Mirror_Case,
+         MirrorStalePch_Case,
+         MirrorStaleHeader_Case,
+         MirrorOmittedFile_Case,
+         MirrorOmittedDir_Case,
+         MirrorShadow_Case,
+         MirrorInstalledHarmless_Case,
+         MirrorInstalledShadow_Case,
+         MirrorCompiler_Case,
+         MirrorNoConfine_Case,
+         MirrorOutsideRoot_Case,
+         MirrorEnv_Case,
+         MirrorPathmap_Case,
+         MirrorBadPathmap_Case,
+         MirrorConfined_Case,
+         MirrorStartRefused_Case,
          # slow tests below here
          Concurrent_Case,
          HundredFold_Case,

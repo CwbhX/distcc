@@ -67,8 +67,14 @@ void dcc_mirror_job_init(struct dcc_mirror_job *job)
 
 void dcc_mirror_job_free(struct dcc_mirror_job *job)
 {
+    int i;
+
     free(job->cwd);
     dcc_mirror_checklist_free(&job->checks);
+    for (i = 0; i < job->n_env; i++)
+        free(job->env[i]);
+    free(job->env);
+    dcc_mirror_rules_free(&job->rules);
     memset(job, 0, sizeof *job);
 }
 
@@ -319,6 +325,24 @@ int dcc_mirror_prepare(char **argv, const char *input_fname,
             || c->ident.mtime > 0xffffffffLL)
             return EXIT_DISTCC_FAILED;
     }
+    if ((ret = dcc_mirror_compiler_ident(argv[0], job->cver))) {
+        rs_log_info("mirror: cannot identify compiler %s", argv[0]);
+        return ret;
+    }
+    for (i = 0; dcc_mirror_env_names[i]; i++) {
+        const char *v = getenv(dcc_mirror_env_names[i]);
+        char **n;
+        if (!v)
+            continue;
+        if (!(n = realloc(job->env, (job->n_env + 2) * sizeof *n)))
+            return EXIT_OUT_OF_MEMORY;
+        job->env = n;
+        if (asprintf(&n[job->n_env], "%s=%s", dcc_mirror_env_names[i], v) < 0)
+            return EXIT_OUT_OF_MEMORY;
+        n[++job->n_env] = NULL;
+    }
+    if ((ret = dcc_mirror_rules_from_env(&job->rules, job->cwd)))
+        return ret;
     return 0;
 }
 
@@ -344,117 +368,236 @@ int dcc_mirror_send_request(int fd, char **argv, struct dcc_mirror_job *job)
             || (ret = dcc_x_token_int(fd, "CHKM", (unsigned) c->ident.mtime)))
             return ret;
     }
+    if ((ret = dcc_x_token_string(fd, "CVER", job->cver))
+        || (ret = dcc_x_argv(fd, "NENV", "ENVS", job->env ? job->env
+                             : (char *[]) { NULL })))
+        return ret;
+    {
+        char **rules;
+        int n_rules;
+        if ((ret = dcc_mirror_rules_list(&job->rules, &rules, &n_rules)))
+            return ret;
+        if (!(rules = realloc(rules, (n_rules + 1) * sizeof *rules)))
+            return EXIT_OUT_OF_MEMORY;
+        rules[n_rules] = NULL;
+        ret = dcc_x_argv(fd, "NRUL", "RULE", rules);
+        dcc_free_argv(rules);
+        if (ret)
+            return ret;
+    }
     tcp_cork_sock(fd, 0);
     return 0;
 }
 
 
-/* A set of paths, to check that DSTA covers what it must. */
-struct path_set {
-    char **items;
-    int n;
-    unsigned char *seen;
+/* Remote entries of the directory currently being read ("L" + "N"). */
+struct pending_listing {
+    char *path;
+    char digest[DCC_SHA256_HEX_LEN + 1];
+    struct dcc_strset names;
+    int active;
 };
 
-static int path_set_index(const struct path_set *s, const char *path)
+/**
+ * An installed directory differs from the helper's copy.  Accept it if no
+ * entry present on only one side (or of a different kind) is named like a
+ * component of a path the compile read.
+ **/
+static int listing_acceptable(struct dcc_mirror_job *job,
+                              struct pending_listing *pl,
+                              const struct dcc_strset *comps)
 {
-    int i;
-    for (i = 0; i < s->n; i++)
-        if (strcmp(s->items[i], path) == 0)
-            return i;
-    return -1;
+    char **local;
+    int n_local, i, ok = 1;
+    struct dcc_mirror_ident id;
+    struct dcc_strset local_set = { NULL, 0, 0 };
+    size_t k;
+
+    if (dcc_mirror_dir_ident(pl->path, &job->rules, &id, &local, &n_local)
+        || id.present != DCC_MIRROR_DIR)
+        return 0;
+    if (strcmp(id.digest, pl->digest) == 0) {
+        dcc_mirror_free_names(local, n_local);
+        return 1;
+    }
+    for (i = 0; i < n_local && ok; i++) {
+        if (dcc_strset_add(&local_set, local[i]))
+            ok = 0;
+        else if (!dcc_strset_has(&pl->names, local[i])
+                 && dcc_strset_has(comps, local[i] + 1)) {
+            rs_log_info("mirror: %s/%s exists only here", pl->path,
+                        local[i] + 1);
+            ok = 0;
+        }
+    }
+    for (k = 0; k < pl->names.cap && ok; k++) {
+        const char *e = pl->names.items[k];
+        if (e && !dcc_strset_has(&local_set, e) && dcc_strset_has(comps, e + 1)) {
+            rs_log_info("mirror: %s/%s exists only on the helper", pl->path,
+                        e + 1);
+            ok = 0;
+        }
+    }
+    dcc_strset_free(&local_set);
+    dcc_mirror_free_names(local, n_local);
+    return ok;
+}
+
+static void pending_reset(struct pending_listing *pl)
+{
+    free(pl->path);
+    dcc_strset_free(&pl->names);
+    memset(pl, 0, sizeof *pl);
 }
 
 
 /**
- * Compare the daemon's description of the files its compile read (DSTA)
- * with this machine's files.  Every path of the check list and every
- * prerequisite of the returned .d must be described, and every described
- * file must be identical here.  Returns 0 on a full match.
+ * Compare the daemon's description of what its compile read (DSTA) with
+ * this machine.  It must describe every prerequisite of the returned .d
+ * and every check-list path (files), and every search directory, the
+ * directory of each of those files and the cwd (directories).  Files must
+ * be identical; synced directories must have the same entries; installed
+ * directories may differ only in entries that no path the compile read
+ * could have been spelled through.  Returns 0 on a full match.
  **/
-int dcc_mirror_verify(struct dcc_mirror_job *job, char *dsta, size_t dsta_len,
+int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
+                      char *dsta, size_t dsta_len,
                       const char *dotd_text, size_t dotd_len,
                       char **first_mismatch)
 {
-    struct path_set dotd = { NULL, 0, NULL };
-    unsigned char *check_seen = NULL;
+    char **dotd_paths = NULL, **files = NULL;
+    int n_dotd = 0, n_files, i, ret = 0;
+    struct dcc_strset file_set = { NULL, 0, 0 }, dir_set = { NULL, 0, 0 };
+    struct dcc_strset comps = { NULL, 0, 0 };
+    struct dcc_strset seen_files = { NULL, 0, 0 }, seen_dirs = { NULL, 0, 0 };
+    struct pending_listing pl;
     char *line, *next, *end = dsta + dsta_len;
-    int ret = 0, i;
+    size_t k;
 
+    memset(&pl, 0, sizeof pl);
     *first_mismatch = NULL;
-    if (dotd_text && dotd_len
-        && (ret = dcc_mirror_parse_dotd(dotd_text, dotd_len,
-                                        &dotd.items, &dotd.n)))
+    if (dotd_len && (ret = dcc_mirror_parse_dotd(dotd_text, dotd_len,
+                                                 &dotd_paths, &n_dotd)))
         return ret;
-    dotd.seen = calloc(dotd.n + 1, 1);
-    check_seen = calloc(job->checks.n + 1, 1);
-    if (!dotd.seen || !check_seen) {
+    n_files = n_dotd + job->checks.n;
+    if (!(files = calloc((size_t) n_files + 1, sizeof *files))) {
         ret = EXIT_OUT_OF_MEMORY;
         goto out;
     }
+    for (i = 0; i < n_dotd; i++)
+        files[i] = dotd_paths[i];
+    for (i = 0; i < job->checks.n; i++)
+        files[n_dotd + i] = job->checks.items[i].path;
+    if ((ret = dcc_mirror_required(argv, files, n_files, &file_set,
+                                   &dir_set, &comps)))
+        goto out;
+
+#define MISMATCH(p) do { ret = EXIT_DISTCC_FAILED; \
+        if (!*first_mismatch) *first_mismatch = strdup(p); goto out; } while (0)
 
     for (line = dsta; line < end; line = next) {
         struct dcc_mirror_ident remote, local;
         char *path, *nl = memchr(line, '\n', (size_t) (end - line));
-        int installed, idx;
 
         if (!nl) {
             ret = EXIT_PROTOCOL_ERROR;
-            break;
+            goto out;
         }
         *nl = '\0';
         next = nl + 1;
+
+        if (line[0] == 'N' && line[1] == ' ') {
+            if (!pl.active || !line[2]) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out;
+            }
+            if ((ret = dcc_strset_add(&pl.names, line + 2)))
+                goto out;
+            continue;
+        }
+        if (pl.active) {
+            if (!listing_acceptable(job, &pl, &comps))
+                MISMATCH(pl.path);
+            pending_reset(&pl);
+        }
         if (dcc_mirror_parse_dsta_line(line, &path, &remote) != 0) {
             rs_log_error("mirror: malformed DSTA line: %s", line);
             ret = EXIT_PROTOCOL_ERROR;
-            break;
+            goto out;
         }
-        installed = dcc_mirror_is_installed_path(path);
-        if (installed && remote.present == DCC_MIRROR_FILE
-            && !remote.digest[0]) {
-            ret = EXIT_DISTCC_FAILED;   /* installed tree needs a digest */
-        } else if ((ret = dcc_mirror_ident_of(path,
-                                              installed && remote.present
-                                              == DCC_MIRROR_FILE,
-                                              &local))) {
-            ;
-        } else if (!dcc_mirror_ident_equal(&remote, &local, installed)) {
-            ret = EXIT_DISTCC_FAILED;
+        if (line[0] == 'L') {
+            if (!(pl.path = strdup(path))) {
+                ret = EXIT_OUT_OF_MEMORY;
+                goto out;
+            }
+            memcpy(pl.digest, remote.digest, sizeof pl.digest);
+            pl.active = 1;
+            if ((ret = dcc_strset_add(&seen_dirs, path)))
+                goto out;
+            continue;
         }
-        if (ret) {
-            *first_mismatch = strdup(path);
-            break;
+
+        if (dcc_strset_has(&dir_set, path)
+            && (remote.present != DCC_MIRROR_FILE
+                || !dcc_strset_has(&file_set, path))) {
+            if ((ret = dcc_mirror_dir_ident(path, &job->rules, &local,
+                                            NULL, NULL)))
+                goto out;
+            if (!dcc_mirror_ident_equal(&remote, &local, 1))
+                MISMATCH(path);
+            if ((ret = dcc_strset_add(&seen_dirs, path)))
+                goto out;
         }
-        for (i = 0; i < job->checks.n; i++)
-            if (strcmp(job->checks.items[i].path, path) == 0)
-                check_seen[i] = 1;
-        if ((idx = path_set_index(&dotd, path)) >= 0)
-            dotd.seen[idx] = 1;
+        if (dcc_strset_has(&file_set, path) && remote.present != DCC_MIRROR_DIR) {
+            int installed = dcc_mirror_is_installed_path(path);
+            if (installed && remote.present == DCC_MIRROR_FILE
+                && !remote.digest[0])
+                MISMATCH(path);
+            if ((ret = dcc_mirror_ident_of(path, installed
+                                           && remote.present == DCC_MIRROR_FILE,
+                                           &local)))
+                goto out;
+            if (!dcc_mirror_ident_equal(&remote, &local, installed))
+                MISMATCH(path);
+            if ((ret = dcc_strset_add(&seen_files, path)))
+                goto out;
+        }
+    }
+    if (pl.active) {
+        if (!listing_acceptable(job, &pl, &comps))
+            MISMATCH(pl.path);
+        pending_reset(&pl);
     }
 
-    if (!ret) {
-        for (i = 0; i < job->checks.n && !ret; i++) {
-            if (!check_seen[i]) {
-                rs_log_error("mirror: daemon did not describe %s",
-                             job->checks.items[i].path);
-                *first_mismatch = strdup(job->checks.items[i].path);
-                ret = EXIT_PROTOCOL_ERROR;
-            }
-        }
-        for (i = 0; i < dotd.n && !ret; i++) {
-            if (!dotd.seen[i]) {
-                rs_log_error("mirror: daemon did not describe %s",
-                             dotd.items[i]);
-                *first_mismatch = strdup(dotd.items[i]);
-                ret = EXIT_PROTOCOL_ERROR;
-            }
+    for (k = 0; k < file_set.cap; k++) {
+        const char *f = file_set.items[k];
+        if (f && !dcc_strset_has(&seen_files, f)) {
+            rs_log_error("mirror: daemon did not describe file %s", f);
+            ret = EXIT_PROTOCOL_ERROR;
+            *first_mismatch = strdup(f);
+            goto out;
         }
     }
+    for (k = 0; k < dir_set.cap; k++) {
+        const char *d = dir_set.items[k];
+        if (d && !dcc_strset_has(&seen_dirs, d)) {
+            rs_log_error("mirror: daemon did not describe directory %s", d);
+            ret = EXIT_PROTOCOL_ERROR;
+            *first_mismatch = strdup(d);
+            goto out;
+        }
+    }
+#undef MISMATCH
 
   out:
-    free(check_seen);
-    free(dotd.seen);
-    dcc_mirror_free_paths(dotd.items, dotd.n);
+    pending_reset(&pl);
+    free(files);
+    dcc_mirror_free_paths(dotd_paths, n_dotd);
+    dcc_strset_free(&file_set);
+    dcc_strset_free(&dir_set);
+    dcc_strset_free(&comps);
+    dcc_strset_free(&seen_files);
+    dcc_strset_free(&seen_dirs);
     return ret;
 }
 
@@ -535,7 +678,8 @@ int dcc_mirror_retrieve_results(int fd, int *status,
 {
     unsigned vers, code, len, o_len;
     char *obj = NULL, *dotd = NULL, *dsta = NULL, *mismatch = NULL;
-    size_t obj_len = 0, dotd_len = 0, dsta_len = 0;
+    char *sout = NULL;
+    size_t obj_len = 0, dotd_len = 0, dsta_len = 0, sout_len = 0;
     char *tmp_o = NULL, *tmp_d = NULL;
     struct timeval before, after;
     int ret;
@@ -553,17 +697,24 @@ int dcc_mirror_retrieve_results(int fd, int *status,
     if ((ret = dcc_r_token_int(fd, "MIRR", &code)))
         return ret;
     if (code != DCC_MIRR_OK) {
+        char *why = NULL;
         *mirr = (int) code;
+        if (dcc_r_token_string(fd, "MIRM", &why) == 0) {
+            rs_log(RS_LOG_INFO|RS_LOG_NONAME, "mirror: MIRR %u: %s",
+                   code, why);
+            free(why);
+        }
         return 0;
     }
 
     dcc_note_state(DCC_PHASE_RECEIVE, NULL, NULL, DCC_REMOTE);
 
+    /* Compiler stdout is held back until the result is accepted, so that
+     * a rejected job does not print it twice. */
     if ((ret = dcc_r_cc_status(fd, status))
         || (ret = dcc_r_token_int(fd, "SERR", &len))
         || (ret = dcc_r_file(fd, server_stderr_fname, len, DCC_COMPRESS_NONE))
-        || (ret = dcc_r_token_int(fd, "SOUT", &len))
-        || (ret = dcc_r_bulk(STDOUT_FILENO, fd, len, DCC_COMPRESS_NONE)))
+        || (ret = read_blob(fd, "SOUT", &sout, &sout_len)))
         goto out;
 
     if ((ret = dcc_r_token_int(fd, "DOTO", &o_len)))
@@ -589,7 +740,8 @@ int dcc_mirror_retrieve_results(int fd, int *status,
         goto out;
 
     gettimeofday(&before, NULL);
-    ret = dcc_mirror_verify(job, dsta, dsta_len, dotd, dotd_len, &mismatch);
+    ret = dcc_mirror_verify(job, job->argv, dsta, dsta_len, dotd, dotd_len,
+                            &mismatch);
     gettimeofday(&after, NULL);
     rs_log_info("mirror: checked %lu bytes of file identities in %ldus",
                 (unsigned long) dsta_len,
@@ -624,6 +776,8 @@ int dcc_mirror_retrieve_results(int fd, int *status,
         ret = EXIT_IO_ERROR;
         goto out;
     }
+    if (sout_len)
+        dcc_writex(STDOUT_FILENO, sout, sout_len);
 
   out:
     if (tmp_o) unlink(tmp_o);
@@ -633,6 +787,7 @@ int dcc_mirror_retrieve_results(int fd, int *status,
     free(obj);
     free(dotd);
     free(dsta);
+    free(sout);
     free(mismatch);
     dcc_mirror_digest_flush();
     return ret;

@@ -126,6 +126,19 @@ int dcc_mirror_set_installed_prefixes(const char *colon_list)
 
 
 /**
+ * The current installed-tree prefixes (not to be freed).
+ **/
+int dcc_mirror_installed_prefixes(char ***prefixes, int *n)
+{
+    if (n_installed_prefixes < 0)
+        dcc_mirror_set_installed_prefixes(getenv("DISTCC_MIRROR_INSTALLED"));
+    *prefixes = installed_prefixes;
+    *n = n_installed_prefixes;
+    return 0;
+}
+
+
+/**
  * Is @p path under an installed tree?  Relative paths never are.
  **/
 int dcc_mirror_is_installed_path(const char *path)
@@ -191,6 +204,8 @@ int dcc_mirror_ident_equal(const struct dcc_mirror_ident *a,
 {
     if (a->present != b->present)
         return 0;
+    if (a->present == DCC_MIRROR_DIR)
+        return strcmp(a->digest, b->digest) == 0;
     if (a->present != DCC_MIRROR_FILE)
         return 1;
     if (a->size != b->size)
@@ -325,8 +340,11 @@ int dcc_mirror_parse_dotd(const char *text, size_t len,
 
 
 /**
- * One DSTA line: "F <size> <mtime> <digest|-> <path>", "A <path>" (absent)
- * or "O <path>" (exists, not a regular file).  The path is the rest of the
+ * One DSTA line: "F <size> <mtime> <digest|-> <path>", "D <hash> <path>"
+ * (a directory and the hash of its counted entries), "A <path>" (absent)
+ * or "O <path>" (exists, neither file nor directory).  A directory may
+ * instead be sent as "L <hash> <path>" followed by one "N <entry>" line per
+ * counted entry; the caller writes and reads those.  The path is the rest of the
  * line, so it may contain spaces; a path containing a newline cannot be
  * represented and is refused.
  **/
@@ -339,7 +357,9 @@ int dcc_mirror_format_dsta_line(const char *path,
     *line_ret = NULL;
     if (strchr(path, '\n'))
         return EXIT_PROTOCOL_ERROR;
-    if (ident->present == DCC_MIRROR_FILE)
+    if (ident->present == DCC_MIRROR_DIR)
+        r = asprintf(line_ret, "D %s %s\n", ident->digest, path);
+    else if (ident->present == DCC_MIRROR_FILE)
         r = asprintf(line_ret, "F %lld %lld %s %s\n",
                      (long long) ident->size, ident->mtime,
                      ident->digest[0] ? ident->digest : "-", path);
@@ -362,6 +382,20 @@ int dcc_mirror_parse_dsta_line(char *line, char **path_ret,
 
     memset(ident, 0, sizeof *ident);
     *path_ret = NULL;
+    if ((line[0] == 'D' || line[0] == 'L') && line[1] == ' ') {
+        int i;
+        p = line + 2;
+        for (i = 0; i < DCC_SHA256_HEX_LEN; i++)
+            if (!((p[i] >= '0' && p[i] <= '9') || (p[i] >= 'a' && p[i] <= 'f')))
+                return EXIT_PROTOCOL_ERROR;
+        if (p[DCC_SHA256_HEX_LEN] != ' ' || !p[DCC_SHA256_HEX_LEN + 1])
+            return EXIT_PROTOCOL_ERROR;
+        memcpy(ident->digest, p, DCC_SHA256_HEX_LEN);
+        ident->digest[DCC_SHA256_HEX_LEN] = '\0';
+        ident->present = DCC_MIRROR_DIR;
+        *path_ret = p + DCC_SHA256_HEX_LEN + 1;
+        return 0;
+    }
     if ((line[0] == 'A' || line[0] == 'O') && line[1] == ' ' && line[2]) {
         ident->present = line[0] == 'A' ? DCC_MIRROR_ABSENT : DCC_MIRROR_OTHER;
         *path_ret = line + 2;

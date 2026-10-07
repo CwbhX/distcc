@@ -139,7 +139,7 @@ static int parse_line(char *line, struct digest_entry *e, char **path)
         if (!((e->hex[i] >= '0' && e->hex[i] <= '9')
               || (e->hex[i] >= 'a' && e->hex[i] <= 'f')))
             return -1;
-    if (line[n] != '/')
+    if (line[n] != '/' && line[n] != 'D')
         return -1;
     *path = line + n;
     return 0;
@@ -156,9 +156,9 @@ static void load_cache(void)
     loaded = 1;
     if (dcc_get_top_dir(&dir) != 0)
         return;
+    /* dcc_get_top_dir() returns its cached string: do not free it. */
     if (asprintf(&cache_fname, "%s/mirror-digests", dir) < 0)
         cache_fname = NULL;
-    free(dir);
     if (!cache_fname || !(f = fopen(cache_fname, "r")))
         return;
     while ((len = getline(&line, &cap, f)) > 0) {
@@ -213,19 +213,53 @@ static void append_line(const struct digest_entry *e)
 }
 
 /**
+ * Look up @p key; succeeds only if the entry was made for a file whose
+ * stat() result is exactly @p st.
+ **/
+int dcc_mirror_cache_get(const char *key, const struct stat *st,
+                         char hex[DCC_SHA256_HEX_LEN + 1])
+{
+    struct digest_entry *e;
+
+    if (!loaded)
+        load_cache();
+    if ((e = lookup(key, 0)) && entry_matches(e, st)) {
+        memcpy(hex, e->hex, sizeof e->hex);
+        return 0;
+    }
+    return -1;
+}
+
+void dcc_mirror_cache_put(const char *key, const struct stat *st,
+                          const char hex[DCC_SHA256_HEX_LEN + 1])
+{
+    struct digest_entry *e;
+
+    if (!loaded)
+        load_cache();
+    if ((e = lookup(key, 1)) != NULL) {
+        e->dev = (unsigned long long) st->st_dev;
+        e->ino = (unsigned long long) st->st_ino;
+        e->size = (unsigned long long) st->st_size;
+        e->mtime_s = (long long) st->st_mtime;
+        e->mtime_ns = ST_MTIME_NS(st);
+        e->ctime_s = ST_CTIME_S(st);
+        e->ctime_ns = ST_CTIME_NS(st);
+        memcpy(e->hex, hex, sizeof e->hex);
+        append_line(e);
+    }
+}
+
+/**
  * The SHA-256 of @p path, whose stat() result is @p st, as lowercase hex.
  **/
 int dcc_mirror_digest(const char *path, const struct stat *st,
                       char hex[DCC_SHA256_HEX_LEN + 1])
 {
-    struct digest_entry *e;
     struct stat after;
     char abs_buf[MAXPATHLEN + 1];
     const char *key = path;
     int ret;
-
-    if (!loaded)
-        load_cache();
 
     /* Cache keys are absolute so the cache can be shared across cwds. */
     if (path[0] != '/') {
@@ -238,10 +272,8 @@ int dcc_mirror_digest(const char *path, const struct stat *st,
         }
     }
 
-    if (key && (e = lookup(key, 0)) && entry_matches(e, st)) {
-        memcpy(hex, e->hex, sizeof e->hex);
+    if (key && dcc_mirror_cache_get(key, st, hex) == 0)
         return 0;
-    }
 
     if ((ret = dcc_sha256_file_hex(path, hex)))
         return ret;
@@ -249,7 +281,7 @@ int dcc_mirror_digest(const char *path, const struct stat *st,
     /* Only record the digest if the file did not change while it was read.
      * A file changing under us is still returned (the comparison will
      * simply fail or succeed on what was read), but not cached. */
-    if (stat(path, &after) == -1 || !key)
+    if (!key || stat(path, &after) == -1)
         return 0;
     if (after.st_ino != st->st_ino || after.st_size != st->st_size
         || after.st_mtime != st->st_mtime
@@ -257,18 +289,7 @@ int dcc_mirror_digest(const char *path, const struct stat *st,
         || ST_CTIME_S(&after) != ST_CTIME_S(st)
         || ST_CTIME_NS(&after) != ST_CTIME_NS(st))
         return 0;
-
-    if ((e = lookup(key, 1)) != NULL) {
-        e->dev = (unsigned long long) st->st_dev;
-        e->ino = (unsigned long long) st->st_ino;
-        e->size = (unsigned long long) st->st_size;
-        e->mtime_s = (long long) st->st_mtime;
-        e->mtime_ns = ST_MTIME_NS(st);
-        e->ctime_s = ST_CTIME_S(st);
-        e->ctime_ns = ST_CTIME_NS(st);
-        memcpy(e->hex, hex, sizeof e->hex);
-        append_line(e);
-    }
+    dcc_mirror_cache_put(key, st, hex);
     return 0;
 }
 

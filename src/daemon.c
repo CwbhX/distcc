@@ -276,7 +276,9 @@ int main(int argc, char *argv[])
     /* Initialize the distcc io timeout value */
     dcc_get_io_timeout();
 
-    if (!opt_enable_tcp_insecure)
+    /* With DISTCC_CMDLIST the command list replaces the masquerade
+     * whitelist (see dcc_check_compiler_and_args). */
+    if (!opt_enable_tcp_insecure && !getenv("DISTCC_CMDLIST"))
         dcc_warn_masquerade_whitelist();
 
     if (dcc_should_be_inetd())

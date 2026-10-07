@@ -36,13 +36,15 @@ enum dcc_mirror_code {
     DCC_MIRR_STALE = 2,         /* pre-check mismatch */
     DCC_MIRR_ARG_POLICY = 3,    /* an argument was refused */
     DCC_MIRR_MISSING = 4,       /* cwd or input missing */
-    DCC_MIRR_NO_CONFINE = 5     /* write confinement could not be set up */
+    DCC_MIRR_NO_CONFINE = 5,    /* write confinement could not be set up */
+    DCC_MIRR_COMPILER = 6       /* the helper's compiler is not the client's */
 };
 
 enum dcc_mirror_kind {
     DCC_MIRROR_ABSENT = 0,
     DCC_MIRROR_FILE = 1,        /* regular file */
-    DCC_MIRROR_OTHER = 2        /* exists, not a regular file */
+    DCC_MIRROR_OTHER = 2,       /* exists, not a regular file */
+    DCC_MIRROR_DIR = 3          /* directory; digest is its listing hash */
 };
 
 /* Identity of one file, as both sides describe it. */
@@ -71,6 +73,7 @@ void dcc_mirror_checklist_free(struct dcc_mirror_checklist *cl);
 
 int dcc_mirror_is_installed_path(const char *path);
 int dcc_mirror_set_installed_prefixes(const char *colon_list);
+int dcc_mirror_installed_prefixes(char ***prefixes, int *n);
 int dcc_mirror_ident_of(const char *path, int want_digest,
                         struct dcc_mirror_ident *ident);
 int dcc_mirror_ident_equal(const struct dcc_mirror_ident *a,
@@ -90,6 +93,52 @@ int dcc_mirror_parse_dsta_line(char *line, char **path_ret,
 /* mirror_digest.c: per-user persistent digest cache. */
 int dcc_mirror_digest(const char *path, const struct stat *st,
                       char hex[DCC_SHA256_HEX_LEN + 1]);
+int dcc_mirror_cache_get(const char *key, const struct stat *st,
+                         char hex[DCC_SHA256_HEX_LEN + 1]);
+void dcc_mirror_cache_put(const char *key, const struct stat *st,
+                          const char hex[DCC_SHA256_HEX_LEN + 1]);
 void dcc_mirror_digest_flush(void);
+
+/* mirror_ident.c: string sets, directory identity, required sets,
+ * compiler identity. */
+struct dcc_strset {
+    char **items;
+    size_t cap, used;
+};
+int dcc_strset_add(struct dcc_strset *s, const char *str);
+int dcc_strset_has(const struct dcc_strset *s, const char *str);
+void dcc_strset_free(struct dcc_strset *s);
+
+/* What the sync leaves out, which directory identity must ignore too. */
+struct dcc_mirror_rules {
+    char **roots;           /* synced source roots */
+    int n_roots;
+    char **excludes;        /* globs left out at the top of each root */
+    int n_excludes;
+    char **build_roots;     /* build trees: only build files are synced */
+    int n_build_roots;
+    char **installed;       /* installed-tree prefixes the client uses */
+    int n_installed;
+    char *cwd;              /* logical cwd, for relative paths */
+};
+int dcc_mirror_rules_from_env(struct dcc_mirror_rules *r, const char *cwd);
+int dcc_mirror_rules_add(struct dcc_mirror_rules *r, const char *rule);
+int dcc_mirror_rules_list(const struct dcc_mirror_rules *r, char ***out,
+                          int *n);
+void dcc_mirror_rules_free(struct dcc_mirror_rules *r);
+
+int dcc_mirror_is_build_file(const char *name);
+int dcc_mirror_dir_ident(const char *path, const struct dcc_mirror_rules *r,
+                         struct dcc_mirror_ident *ident,
+                         char ***names_ret, int *n_names);
+void dcc_mirror_free_names(char **names, int n);
+int dcc_mirror_search_dirs(char **argv, char ***dirs_ret, int *n_ret);
+int dcc_mirror_required(char **argv, char **files, int n_files,
+                        struct dcc_strset *file_set,
+                        struct dcc_strset *dir_set,
+                        struct dcc_strset *comps);
+int dcc_mirror_compiler_ident(const char *argv0,
+                              char hex[DCC_SHA256_HEX_LEN + 1]);
+extern const char *const dcc_mirror_env_names[];
 
 #endif /* DISTCC_MIRROR_H */
