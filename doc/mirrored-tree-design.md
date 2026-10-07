@@ -81,21 +81,21 @@ PCH/non-PCH ratio matches the host's.
   `/tmp/.com.apple.dt.CommandLineTools.installondemand.in-progress`. Since
   then a PCH built on the host and copied with `rsync -a` loads on the M6,
   and both Macs produce byte-identical `.o` and `.d` from it.
-- **Physical vs logical cwd.** `~/Git/Ohmly/build-dev` is a symlink to
+- **Physical vs logical cwd.** `~/Git/Ohmly` is a real directory, but
+  `~/Git/Ohmly/build-dev` is a symlink to
   `/Volumes/ExternalSSD/Developer/Ohmly/build-dev`. `dcc_x_cwd`
-  (`src/clirpc.c:95`) sends `getcwd()`, which is the physical path. The M6 has
-  no `/Volumes/ExternalSSD`. Commands mix logical absolute paths
-  (`-I/Users/.../Git/Ohmly/build-dev/...`) with paths relative to the
-  physical cwd (`-o pcbnew/CMakeFiles/...`), and ccache's
-  `base_dir=/Users/clementhathaway/Git` may turn absolute paths into relative
-  ones. The mirror must therefore reproduce **both** paths: the same symlink
-  at `~/Git/Ohmly/build-dev`, and the same physical target. The M6 has no
-  external drive, so that most simply means an APFS volume named
-  `ExternalSSD` on its internal disk (`diskutil apfs addVolume disk3 APFS
-  ExternalSSD`; it shares the container's free space and mounts at
-  `/Volumes/ExternalSSD`; creating it needs admin rights). A root-owned
-  symlink `/Volumes/ExternalSSD` to a directory in the home folder would also
-  do, and needs `sudo` too.
+  (`src/clirpc.c:95`) sends `getcwd()`, which is the physical path, and the
+  M6 has no external drive. That path does not need to exist there. The
+  argv distcc receives for an Ohmly compile (captured after ccache 4.13.6
+  with `base_dir=/Users/clementhathaway/Git`, with `$PWD` both logical and
+  physical) names every input by an absolute logical path: the source file,
+  every `-I`, the PCH and its header, generated headers under
+  `~/Git/Ohmly/build-dev`. The only relative paths are the outputs (`-o`,
+  `-MF`, `-MT`), which the daemon replaces with temp files anyway. ccache
+  rewrote nothing to a relative path, because the physical cwd is outside
+  `base_dir`. So the client sends the cwd under its logical name (see
+  `DISTCC_MIRROR_PATHMAP` below), and on the M6 `~/Git/Ohmly/build-dev` is a
+  plain directory.
 - **External headers.** ninja's deps log for `build-dev` lists 6984 distinct
   external headers: 2783 from `MacOSX26.5.sdk`, 34 clang builtins, 3596 from
   17 Homebrew formulae (abseil 20260107.1, boost 1.90.0_1, cairo 1.18.4,
@@ -137,10 +137,18 @@ PCH/non-PCH ratio matches the host's.
 - `,mirror` and `,cpp` together is a hostspec error. `,lzo` with `,mirror` is
   rejected at first (the payload is one `.o`; compression can come later by
   adding a feature word to the version 4 request).
-- Optional client filter `DISTCC_MIRROR_ROOTS=/Users/clementhathaway/Git/Ohmly:/Volumes/ExternalSSD/Developer/Ohmly`.
-  Jobs whose cwd is outside these roots use the classic path to the same
-  host. Without it every job tries mirror first; a miss costs one round trip
-  (~0.4 ms on this link) plus a reconnect.
+- `DISTCC_MIRROR_PATHMAP=/Volumes/ExternalSSD/Developer/Ohmly/build-dev=/Users/clementhathaway/Git/Ohmly/build-dev`
+  (colon-separated `physical=logical` prefix pairs). The client rewrites the
+  physical cwd's prefix to the logical one before sending `CDIR`, and first
+  checks that both name the same directory on the host (same device and
+  inode); if not, the job does not use mirror mode. `$PWD` is not used: it
+  is wrong whenever ninja runs with `-C`.
+- Optional client filter `DISTCC_MIRROR_ROOTS=/Users/clementhathaway/Git/Ohmly`,
+  matched against the cwd after mapping. Jobs whose cwd is outside these
+  roots use the classic path to the same host. The same roots tell
+  `distcc --mirror-sync` what to copy. Without the filter every job tries
+  mirror first; a miss costs one round trip (~0.4 ms on this link) plus a
+  reconnect.
 - **No local cpp lock.** For a mirrored job, `dcc_build_somewhere` must skip
   `dcc_lock_local_cpp` (`src/compile.c:777`). The client does only a few
   `stat`s before sending and a few thousand after. This sidesteps findings 1
@@ -162,7 +170,7 @@ Request:
 
 ```text
 DIST 4
-CDIR <physical cwd>         as dcc_x_cwd today
+CDIR <cwd>                  physical cwd after DISTCC_MIRROR_PATHMAP
 ARGC/ARGV                   argv after dcc_scan_args and client rewrites; original -o, -MF, -MT kept
 NCHK <n>                    check list (see Staleness): the input, every PCH operand,
                             every -include operand and its implicit PCH candidates
@@ -282,8 +290,9 @@ sync replaces it and a size/mtime check afterwards sees only the final,
 matching metadata, so the checks below cannot catch a sync that runs while
 jobs are in flight; second-resolution mtimes also miss a same-size edit
 within one second. The design therefore requires one of: (a) the sync runs
-to completion before the build starts and never during it (what the
-`ohmly.sh` phases below do; the simplest and the recommended first step), or
+to completion before the build starts and never during it (what running
+`distcc --mirror-sync` before `ninja` does; the simplest and the recommended
+first step), or
 (b) each sync publishes a new immutable generation of the mirror (new
 directory, atomically renamed into place, old generations kept until their
 jobs finish) and every job is pinned to the generation it started on. The
@@ -363,29 +372,53 @@ What happens when stale:
 | Remote compile failed (e.g. PCH rejected by clang, `-Winvalid-pch`, or a write denied by the confinement) | Existing logic: `dcc_critique_status` then local retry (`src/compile.c:935`). Clang accepting a PCH is not evidence that it is current; that is the post-check's job. |
 | Post-check mismatch, including a check-list path missing from `DSTA` | Discard `.o` and `.d`, compile locally (simplest, and the slot was already spent). Log the first differing path. |
 
-**The sync step (outside distcc, in `ohmly.sh`).** The PCH and generated
-headers are build outputs, so a sync before the build is not enough:
+**Getting files onto the helper: `distcc --mirror-sync`.** No git is
+involved: the sync copies the working tree as it is on disk, uncommitted
+edits included. It is a new client mode, so the build script runs one
+command before `ninja` instead of a hand-written rsync phase:
 
-1. `rsync -a --delete` the source tree to the M6, excluding `.git`,
-   `build-*`, `output`, `tmp`.
-2. Build the PCHs and generated headers locally first:
-   `ninja <the 9 cmake_pch.hxx.pch targets> <generated headers>`. The PCH
-   targets are named in `build.ninja`, e.g.
-   `common/CMakeFiles/kicommon.dir/cmake_pch.hxx.pch`.
-3. `rsync -a -W` the `build-dev` subset that compiles read: `*.pch`,
-   `cmake_pch.hxx*`, and generated `*.h/*.hpp/*.inc/*.cpp/*.cc`. `-a` keeps
-   the PCH mtimes the post-check compares.
-4. `rsync -a` the kicad-mac-builder dest dirs. Homebrew kegs and the CLT
-   are not synced: they are installed on the M6 at the host's versions
-   (exact kegs copied and pinned, see Facts) and checked by digest, so a
-   version drift costs speed, not correctness.
-5. Run the build with `,mirror` active.
+```sh
+ninja <PCH targets> <generated headers>   # build outputs the compiles read
+distcc --mirror-sync                      # copy them and the sources
+ninja                                     # the build, with ,mirror active
+```
+
+For each `,mirror` host (or the ssh destinations given on the command line,
+e.g. `distcc --mirror-sync m6`) it runs `rsync -a --delete` over ssh, with
+filters, for:
+
+1. **Sources:** each `DISTCC_MIRROR_ROOTS` root, only code files (`*.h`,
+   `*.hpp`, `*.hxx`, `*.inc`, `*.ipp`, `*.c`, `*.cc`, `*.cpp`, `*.cxx`,
+   `*.m`, `*.mm`; configurable), skipping `.git` and build dirs. Ohmly's
+   compiles read 6498 such files (104 MB) out of a 1.42 GB tree. `--delete`
+   within the filter removes headers deleted on the host, so a stale copy
+   cannot shadow another include path.
+2. **Build outputs:** the logical build dirs from `DISTCC_MIRROR_PATHMAP`,
+   only `*.pch`, `cmake_pch.hxx*` and generated code files (121 files,
+   41 MB, plus 628 MB of PCHs on Ohmly). `-a` keeps the mtimes the
+   post-check compares.
+3. **Extra trees** listed in `DISTCC_MIRROR_EXTRA` (Ohmly: the
+   kicad-mac-builder dest dirs), copied whole.
+
+Homebrew kegs and the CLT are not synced: they are installed on the M6 at
+the host's versions (exact kegs copied and pinned, see Facts) and checked by
+digest, so a version drift costs speed, not correctness.
+
+PCHs and generated headers are build outputs, so they have to exist before
+the sync; distcc cannot know a project's targets, which is why the first
+`ninja` line stays in the build script. If it is skipped, nothing breaks:
+jobs whose PCH is missing or old on the helper fail the check and compile
+locally. A later step could let the client push a missing or stale PCH
+itself when the daemon reports it (40–113 MB, 0.3–0.7 s), but that writes
+into the mirror during a build, so the daemon would also have to record
+each check-list file's inode before and after the compile and reject the
+job if it changed.
 
 Sizes and times from the host (estimates where marked):
 
 | Item | Size | Transfer |
 |---|---|---|
-| Source tree, no `.git`/build dirs | 1.42 GB (137 MB of it is code files) | first copy: ~10–60 s (estimate); unchanged re-sync: file walk ~3.6 s (local `rsync -an` dry run) |
+| Source code files read by compiles | 104 MB of a 1.42 GB tree | first copy: < 5 s at the measured rate (estimate); unchanged re-sync: file walk under the 3.6 s measured for the whole tree (local `rsync -an` dry run) |
 | 9 PCH files | 658 MB | 3.9 s for all nine (measured: streamed over `ssh m6` to `wc -c`, ~170 MB/s) |
 | Generated code in `build-dev` | 165 files, 46 MB | < 1 s (estimate) |
 | kicad-mac-builder dest dirs | 238 MB whole (copied once on 2026-10-06), ~10 MB of headers | < 1 s when unchanged (estimate) |
@@ -433,8 +466,8 @@ scope. Any header change that rebuilds a PCH costs one 40–113 MB copy
   unconfined.
 - **Old daemon with `,mirror`**: connection fails, host backed off. Document
   it; do not auto-downgrade.
-- **Disk on the M6**: about 2.4 GB for source, build subset and external
-  headers; it has 135 GB free.
+- **Disk on the M6**: about 1.7 GB for source code, build subset, PCHs,
+  kicad-mac-builder and the copied Homebrew kegs; it has 135 GB free.
 
 ## Implementation plan (smallest shippable step first)
 
@@ -449,8 +482,10 @@ scope. Any header change that rebuilds a PCH costs one 40–113 MB copy
    <mirror>` all denied; a malformed profile makes `sandbox-exec` exit 65
    without running anything), the PCH version error, and (2026-10-07,
    after matching CLT) a host-built PCH loading on the M6 with
-   byte-identical output. Still open: the `ExternalSSD` volume and source
-   tree on the M6, and the one-TU proof itself.
+   byte-identical output, and the argv of a real Ohmly compile (only
+   outputs are relative, so the physical cwd need not exist on the M6).
+   Still open: the first sync of sources and build outputs, and the one-TU
+   proof itself.
 1. **Mirror protocol with complete post-check, write confinement and local
    fallback.**
    `src/distcc.h` (`DCC_CPP_MIRROR`, `DCC_VER_4`); `src/hosts.c`
@@ -476,8 +511,11 @@ scope. Any header change that rebuilds a PCH costs one 40–113 MB copy
    (reuse the pump-mode pattern of switching `host->cpp_where` and
    `protover` mid-job, `src/compile.c:806`). Add `DISTCC_MIRROR_ROOTS`.
    These save time; they do not add correctness, which step 1 already has.
-3. **`ohmly.sh` sync phases** (outside this repo) and a re-run of the pool
-   benchmark on a real Ohmly rebuild.
+3. **`distcc --mirror-sync`** (`src/mirror_sync.c`, building rsync and ssh
+   argv from `DISTCC_HOSTS`, `DISTCC_MIRROR_ROOTS`,
+   `DISTCC_MIRROR_PATHMAP` and `DISTCC_MIRROR_EXTRA`), `ohmly.sh` calling it
+   after building the PCHs, and a re-run of the pool benchmark on a real
+   Ohmly rebuild.
 4. Later: `CVER` compiler identity, LZO, a distccmon phase for mirrored
    jobs.
 
@@ -520,6 +558,10 @@ job holds that local object.
   output-writing option that slipped past the argument policy (test build
   with the policy off, e.g. `-Wp,-MD,<mirror path>`) fails remotely and is
   retried locally, and the mirror is unchanged.
+- **Logical cwd.** A job started from the physical build dir is sent with
+  the mapped logical cwd and accepted; with a `DISTCC_MIRROR_PATHMAP` entry
+  whose two sides are different directories on the host, the job does not
+  use mirror mode.
 - **Confinement unavailable.** With confinement setup forced to fail (test
   hook, or the `sandbox-exec` binary unavailable), `distccd --mirror-root`
   refuses to start; with the failure injected per job, the daemon answers
@@ -589,3 +631,46 @@ eeschema/sch_symbol.cpp common/eda_draw_frame.cpp`. For each TU it takes the
 Link throughput: `find build-dev -name '*.pch' -exec cat {} + | ssh m6 'wc
 -c'` (658,549,964 bytes, 3.89 s). Tree walk: `rsync -an --stats` of `Ohmly/`
 (with the excludes above) to an empty local scratch dir, 3.65 s.
+
+## Appendix: M6 setup and checks (2026-10-06 and 2026-10-07)
+
+What was changed on the M6, over `ssh m6`, to bring it to header parity with
+the host. A copy of this list lives on the M6 in `~/M6-SETUP-NOTES.md`. The
+running `distccd` (Homebrew distcc 3.4, LaunchAgent `com.ohmly.distccd`) was
+not touched.
+
+- **Homebrew kegs:** the 16 formulae Ohmly's compiles read, copied from the
+  host's Cellar at the host's exact versions with `rsync -a
+  /opt/homebrew/Cellar/<name>/<version>`, then `brew link <name>` and
+  `brew pin <name>` (zstd 1.5.7_1 was already present at the same version
+  and was pinned too). `brew install` was not used because it would have
+  installed newer versions of nine of them. Dependencies of these kegs were
+  not installed, so `brew doctor` may complain; that does not affect
+  compiling. A formula upgraded on the host has to be copied again.
+- **kicad-mac-builder:** `~/Github/kicad-mac-builder/build/{wxwidgets,python,ngspice}-dest`
+  copied with `rsync -a` to the same paths (238 MB).
+- **SDK:** nothing to do; the M6 already had `MacOSX26.5.sdk`.
+- **Command Line Tools:** the host was updated to Command Line Tools for
+  Xcode 27.0 (clang-2100.3.34.2, the M6's version) on 2026-10-07; see Facts
+  for why Software Update did not offer it at first. This invalidated the
+  host's existing PCHs, which the next build regenerates.
+- **Not needed:** a `/Volumes/ExternalSSD` volume (the client sends the
+  logical cwd, see Facts) and git on the M6 (`distcc --mirror-sync` copies
+  the working tree).
+- **Not done yet:** copying the Ohmly sources and `build-dev` outputs; that
+  waits for `distcc --mirror-sync`.
+
+Checks run, all in `~/mirror-test` on both Macs (deleted afterwards) or
+read-only:
+
+| Check | Result |
+|---|---|
+| openrsync mtime precision | whole seconds kept, nanoseconds dropped on the M6 |
+| PCH rebuilt from an unchanged `__TIME__` header | same size (825,820 B), different mtime; clang accepts both, output differs, `.d` identical |
+| Same-size header edit | caught by mtime |
+| `sandbox-exec` profile allowing writes only in the job dir | real compile succeeds; writes to the mirror, `$HOME`, `/tmp`, `-Wp,-MD,<mirror>`, `-save-temps=cwd` and `-o <mirror>` denied; malformed profile exits 65 without running anything |
+| Host PCH on the M6, before the CLT update | rejected: "built from a different branch" |
+| Host PCH on the M6, after the CLT update | accepted; `.o` and `.d` byte-identical to the host's |
+| 6984 external headers from ninja's deps log | after the keg copy and CLT update: identical size, mtime (symlinks followed) and content on both Macs |
+| SHA-256 of the 6413 Homebrew and CLT headers | 61 MB, 0.28 s on the host |
+| argv of an Ohmly compile after ccache | all inputs absolute logical paths; only `-o`, `-MF`, `-MT` relative; no `/Volumes` path |
