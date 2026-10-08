@@ -55,6 +55,7 @@
 #include "mirror.h"
 #include "mirror_search.h"
 
+/* Where a search option adds its directory; -1: not supported. */
 enum search_group {
     G_QUOTE = 0,
     G_ANGLE,        /* -I, -F, CPATH */
@@ -95,17 +96,6 @@ static const struct search_option search_options[] = {
     { "-F", G_ANGLE, 1, 1, 0 },
     { NULL, 0, 0, 0, 0 }
 };
-
-/* Environment variables that add search directories, and where. */
-static const struct { const char *name; int group; } search_env[] = {
-    { "CPATH", G_ANGLE },
-    { "C_INCLUDE_PATH", G_SYSTEM },
-    { "CPLUS_INCLUDE_PATH", G_SYSTEM },
-    { "OBJC_INCLUDE_PATH", G_SYSTEM },
-    { "OBJCPLUS_INCLUDE_PATH", G_SYSTEM },
-    { NULL, 0 }
-};
-
 
 /**
  * Is argv[i] a search-path option?  On a match, *opt is set, *val to its
@@ -198,13 +188,7 @@ static int search_list_add(struct dcc_search_list *sl,
 
     if (!(norm = dcc_mirror_normalize(r, spelled)))
         return EXIT_OUT_OF_MEMORY;
-    /* The compiler drops a directory already in the list. */
-    for (i = 0; i < sl->n; i++) {
-        if (strcmp(sl->d[i].norm, norm) == 0) {
-            free(norm);
-            return 0;
-        }
-    }
+    (void) i;   /* the compiler's list is used as is, duplicates included */
     if (!(n = realloc(sl->d, (sl->n + 1) * sizeof *n))) {
         free(norm);
         return EXIT_OUT_OF_MEMORY;
@@ -220,24 +204,7 @@ static int search_list_add(struct dcc_search_list *sl,
     return 0;
 }
 
-/* Add the directories of a colon-separated environment path; an empty
- * element means the cwd. */
-static int add_env_path(struct dcc_search_list *sl,
-                        const struct dcc_mirror_rules *r, const char *value)
-{
-    char *copy, *p, *tok;
-    int ret = 0;
-
-    if (!(copy = strdup(value)))
-        return EXIT_OUT_OF_MEMORY;
-    for (p = copy; !ret && (tok = strsep(&p, ":")) != NULL; )
-        ret = search_list_add(sl, r, *tok ? tok : ".", 0);
-    free(copy);
-    return ret;
-}
-
-
-/* ----- the compiler's implicit directories ----- */
+/* ----- the search path, as the compiler reports it ----- */
 
 /* The language the compiler sees for @p input, or NULL. */
 static const char *input_language(char **argv, const char *input)
@@ -271,8 +238,8 @@ static const char *input_language(char **argv, const char *input)
     return NULL;
 }
 
-/* Flags that change the implicit directories. */
-static int implicit_flag(char **argv, int i, int *takes_arg)
+/* Other flags that change the search path. */
+static int path_flag(char **argv, int i, int *takes_arg)
 {
     static const char *const with_arg[] = {
         "-isysroot", "--sysroot", "-target", "-arch", "-resource-dir",
@@ -298,127 +265,107 @@ static int implicit_flag(char **argv, int i, int *takes_arg)
     return 0;
 }
 
-static char *implicit_cache_fname(void)
+static char *probe_cache_fname(void)
 {
     char *dir, *f;
     if (dcc_get_top_dir(&dir) != 0)
         return NULL;
-    if (asprintf(&f, "%s/mirror-implicit", dir) < 0)
+    if (asprintf(&f, "%s/mirror-searchpath", dir) < 0)
         return NULL;
     return f;
 }
 
-/* Parse "D:path\tF:path..." into the list (implicit group). */
-static int implicit_parse(struct dcc_search_list *sl,
-                          const struct dcc_mirror_rules *r, char *entries)
+/* Parse "D:path\tF:path..." (one cache entry) into the list. */
+static int entries_parse(struct dcc_search_list *sl,
+                         const struct dcc_mirror_rules *r, char *entries)
 {
     char *p, *tok;
     int ret = 0;
 
-    for (p = entries; !ret && (tok = strsep(&p, "\t")) != NULL; ) {
-        if ((tok[0] == 'D' || tok[0] == 'F') && tok[1] == ':' && tok[2] == '/')
+    for (p = entries; !ret && (tok = strsep(&p, "\t")) != NULL; )
+        if ((tok[0] == 'D' || tok[0] == 'F') && tok[1] == ':' && tok[2])
             ret = search_list_add(sl, r, tok + 2, tok[0] == 'F');
-    }
     return ret;
 }
 
 /**
- * Add the compiler's implicit include directories for this command.
- * Runs "<compiler> <flags> -x <lang> -E -v -" once per compiler binary and
- * set of relevant flags, and keeps the answer in $DISTCC_DIR.
+ * Turn the compiler's "-v" report into cache entries: every directory of
+ * the "..." and the <...> list, in order.  Fails on anything not modelled
+ * (header maps).
  **/
-static int add_implicit_dirs(struct dcc_search_list *sl, char **argv,
-                             const char *input,
-                             const struct dcc_mirror_rules *r)
+static int entries_from_report(char *report, char **entries_ret)
 {
-    char cver[DCC_SHA256_HEX_LEN + 1], keyhex[DCC_SHA256_HEX_LEN + 1];
-    struct dcc_sha256 ctx;
-    uint8_t dg[DCC_SHA256_LEN];
-    char *probe[64], *fname = NULL, *line = NULL, *out = NULL, *entries = NULL;
-    const char *lang = input_language(argv, input);
-    int n = 0, i, ret = 0, pipefd[2], status;
-    size_t cap = 0, out_len = 0, out_cap = 0;
-    ssize_t len;
-    FILE *f;
-    pid_t pid;
-    static const char *const env_keys[] = { "SDKROOT", "DEVELOPER_DIR", NULL };
+    char *start = strstr(report, "#include \"...\" search starts here:\n");
+    char *angle = strstr(report, "#include <...> search starts here:\n");
+    char *end = angle ? strstr(angle, "End of search list.") : NULL;
+    char *entries, *p, *l;
+    size_t elen = 0;
 
-    if (!lang)
+    *entries_ret = NULL;
+    if (!angle || !end)
         return EXIT_DISTCC_FAILED;
-    if ((ret = dcc_mirror_compiler_ident(argv[0], cver)))
-        return ret;
-
-    probe[n++] = argv[0];
-    for (i = 1; argv[i] && n < 56; i++) {
-        int takes;
-        if (implicit_flag(argv, i, &takes)) {
-            probe[n++] = argv[i];
-            if (takes)
-                probe[n++] = argv[++i];
+    if (!start || start > angle)
+        start = angle;
+    *end = '\0';
+    if (!(entries = calloc(strlen(start) * 2 + 16, 1)))
+        return EXIT_OUT_OF_MEMORY;
+    for (p = start; (l = strsep(&p, "\n")) != NULL; ) {
+        char *suffix;
+        int fw = 0;
+        if (l[0] != ' ')
+            continue;           /* a heading */
+        while (*l == ' ')
+            l++;
+        if (!*l)
+            continue;
+        if (strstr(l, " (headermap)")) {
+            free(entries);
+            return EXIT_DISTCC_FAILED;
         }
-    }
-    if (argv[i])
-        return EXIT_DISTCC_FAILED;      /* too many flags to probe */
-    probe[n++] = (char *) "-x";
-    probe[n++] = (char *) lang;
-    probe[n++] = (char *) "-E";
-    probe[n++] = (char *) "-v";
-    probe[n++] = (char *) "-";
-    probe[n] = NULL;
-
-    dcc_sha256_init(&ctx);
-    dcc_sha256_update(&ctx, cver, strlen(cver) + 1);
-    for (i = 0; i < n; i++)
-        dcc_sha256_update(&ctx, probe[i], strlen(probe[i]) + 1);
-    for (i = 0; env_keys[i]; i++) {
-        const char *v = getenv(env_keys[i]);
-        dcc_sha256_update(&ctx, env_keys[i], strlen(env_keys[i]) + 1);
-        dcc_sha256_update(&ctx, v ? v : "", strlen(v ? v : "") + 1);
-    }
-    dcc_sha256_final(&ctx, dg);
-    for (i = 0; i < DCC_SHA256_LEN; i++)
-        sprintf(keyhex + 2 * i, "%02x", dg[i]);
-
-    /* Cached? */
-    fname = implicit_cache_fname();
-    if (fname && (f = fopen(fname, "r"))) {
-        while ((len = getline(&line, &cap, f)) > 0) {
-            if (line[len - 1] != '\n')
-                break;
-            line[len - 1] = '\0';
-            if (strncmp(line, keyhex, DCC_SHA256_HEX_LEN) == 0
-                && line[DCC_SHA256_HEX_LEN] == ' ') {
-                ret = implicit_parse(sl, r, line + DCC_SHA256_HEX_LEN + 1);
-                fclose(f);
-                free(line);
-                free(fname);
-                return ret;
-            }
+        if ((suffix = strstr(l, " (framework directory)"))) {
+            *suffix = '\0';
+            fw = 1;
         }
-        fclose(f);
+        if (strchr(l, '\t')) {
+            free(entries);
+            return EXIT_DISTCC_FAILED;
+        }
+        elen += (size_t) sprintf(entries + elen, "%s%c:%s", elen ? "\t" : "",
+                                 fw ? 'F' : 'D', l);
     }
+    *entries_ret = entries;
+    return 0;
+}
 
-    /* Ask the compiler, without the environment's search paths so that
-     * only its own directories are listed. */
-    if (pipe(pipefd) == -1) {
-        ret = EXIT_DISTCC_FAILED;
-        goto out;
-    }
+/**
+ * Run a probe locally (the client): its stderr is returned.  The client
+ * runs the user's compiler anyway, so no confinement is needed here; the
+ * daemon supplies its own, confined, runner.
+ **/
+int dcc_mirror_probe_local(void *ctx, char **argv, char **err_ret)
+{
+    int pipefd[2], status, i;
+    char *out = NULL;
+    size_t out_len = 0, out_cap = 0;
+    pid_t pid;
+
+    (void) ctx;
+    *err_ret = NULL;
+    if (pipe(pipefd) == -1)
+        return EXIT_DISTCC_FAILED;
     if ((pid = fork()) == -1) {
         close(pipefd[0]);
         close(pipefd[1]);
-        ret = EXIT_DISTCC_FAILED;
-        goto out;
+        return EXIT_DISTCC_FAILED;
     }
     if (pid == 0) {
         int devnull = open("/dev/null", O_RDWR);
-        for (i = 0; search_env[i].name; i++)
-            unsetenv(search_env[i].name);
         dup2(devnull, 0);
         dup2(devnull, 1);
         dup2(pipefd[1], 2);
-        close(pipefd[0]);
-        execvp(probe[0], probe);
+        for (i = 3; i < 256; i++)
+            close(i);
+        execvp(argv[0], argv);
         _exit(127);
     }
     close(pipefd[1]);
@@ -435,8 +382,10 @@ static int add_implicit_dirs(struct dcc_search_list *sl, char **argv,
             while (nc < out_len + (size_t) got + 1)
                 nc *= 2;
             if (!(nb = realloc(out, nc))) {
-                ret = EXIT_OUT_OF_MEMORY;
-                break;
+                free(out);
+                close(pipefd[0]);
+                waitpid(pid, &status, 0);
+                return EXIT_OUT_OF_MEMORY;
             }
             out = nb;
             out_cap = nc;
@@ -447,105 +396,173 @@ static int add_implicit_dirs(struct dcc_search_list *sl, char **argv,
     close(pipefd[0]);
     while (waitpid(pid, &status, 0) == -1 && errno == EINTR)
         ;
-    if (ret)
-        goto out;
     if (!out || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        rs_log_info("mirror: could not ask %s for its search path", argv[0]);
-        ret = EXIT_DISTCC_FAILED;
-        goto out;
+        free(out);
+        return EXIT_DISTCC_FAILED;
     }
     out[out_len] = '\0';
-    {
-        char *start = strstr(out, "#include <...> search starts here:\n");
-        char *end = start ? strstr(start, "End of search list.") : NULL;
-        char *p, *l;
-        size_t elen = 0;
-        if (!start || !end) {
-            ret = EXIT_DISTCC_FAILED;
-            goto out;
-        }
-        *end = '\0';
-        start += strlen("#include <...> search starts here:\n");
-        if (!(entries = calloc(strlen(start) * 2 + 16, 1))) {
-            ret = EXIT_OUT_OF_MEMORY;
-            goto out;
-        }
-        for (p = start; (l = strsep(&p, "\n")) != NULL; ) {
-            char *suffix;
-            int fw = 0;
-            while (*l == ' ')
-                l++;
-            if (!*l)
-                continue;
-            if ((suffix = strstr(l, " (framework directory)"))) {
-                *suffix = '\0';
-                fw = 1;
-            }
-            if (l[0] != '/' || strchr(l, '\t'))
-                continue;
-            elen += (size_t) sprintf(entries + elen, "%s%c:%s",
-                                     elen ? "\t" : "", fw ? 'F' : 'D', l);
-        }
-    }
-    /* Record, then use. */
-    if (fname && (f = fopen(fname, "a"))) {
-        fprintf(f, "%s %s\n", keyhex, entries);
-        fclose(f);
-    }
-    ret = implicit_parse(sl, r, entries);
-
-  out:
-    free(entries);
-    free(out);
-    free(line);
-    free(fname);
-    return ret;
+    *err_ret = out;
+    return 0;
 }
 
+static int push_arg(char ***v, int *n, int *cap, const char *a)
+{
+    if (*n + 2 > *cap) {
+        int nc = *cap ? *cap * 2 : 64;
+        char **nv = realloc(*v, nc * sizeof *nv);
+        if (!nv)
+            return EXIT_OUT_OF_MEMORY;
+        *v = nv;
+        *cap = nc;
+    }
+    (*v)[(*n)++] = (char *) a;
+    (*v)[*n] = NULL;
+    return 0;
+}
 
 /**
- * The include search path of a compile, in order.  With @p implicit, the
- * compiler's own directories are added (this may run the compiler once).
+ * The include search path of a compile, in order, as the compiler itself
+ * reports it: "<compiler> <the job's search and target flags> -x <lang>
+ * -E -v -" run in the cwd with the job's environment, so that the
+ * compiler applies its own rules (duplicates, missing directories, system
+ * directory precedence) instead of a model of them.  The answer is cached
+ * in $DISTCC_DIR, keyed by the compiler binary, the cwd, the probe, the
+ * environment, and which search directories exist.  @p run executes the
+ * probe; @p fn maps a path to the one to stat on this side (NULL: as is).
  * Fails if argv uses a search option mirror mode does not model.
  **/
 int dcc_mirror_search_list(char **argv, const char *input,
-                           const struct dcc_mirror_rules *r, int implicit,
+                           const struct dcc_mirror_rules *r,
+                           dcc_mirror_probe_fn run, void *run_ctx,
+                           dcc_mirror_resolve_fn fn, const void *fn_ctx,
                            struct dcc_search_list *sl)
 {
-    int group, i, k, ret = 0;
+    static const char *const env_keys[] = {
+        "CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH", "OBJC_INCLUDE_PATH",
+        "OBJCPLUS_INCLUDE_PATH", "SDKROOT", "DEVELOPER_DIR", NULL
+    };
+    char cver[DCC_SHA256_HEX_LEN + 1], keyhex[DCC_SHA256_HEX_LEN + 1];
+    char **probe = NULL, *fname = NULL, *line = NULL, *report = NULL;
+    char *entries = NULL;
+    const char *lang = input_language(argv, input);
+    struct dcc_sha256 ctx;
+    uint8_t dg[DCC_SHA256_LEN];
+    int n = 0, cap = 0, i, ret;
+    size_t lcap = 0;
+    ssize_t len;
+    FILE *f;
 
     memset(sl, 0, sizeof *sl);
     if ((ret = dcc_mirror_check_search_options(argv)))
         return ret;
-    for (group = 0; group < G_COUNT && !ret; group++) {
-        if (group == G_IMPLICIT) {
-            if (implicit)
-                ret = add_implicit_dirs(sl, argv, input, r);
+    if (!lang)
+        return EXIT_DISTCC_FAILED;
+    if ((ret = dcc_mirror_compiler_ident(argv[0], cver)))
+        return ret;
+
+    dcc_sha256_init(&ctx);
+    dcc_sha256_update(&ctx, cver, strlen(cver) + 1);
+    dcc_sha256_update(&ctx, r->cwd, strlen(r->cwd) + 1);
+
+    /* The probe: the job's search options (as given, in order) and the
+     * flags that change the compiler's own directories. */
+    if ((ret = push_arg(&probe, &n, &cap, argv[0])))
+        goto out;
+    for (i = 1; argv[i] && !ret; i++) {
+        const struct search_option *o;
+        const char *val;
+        int consumed, takes;
+        if (strcmp(argv[i], "-Xclang") == 0
+            || strcmp(argv[i], "-Xpreprocessor") == 0) {
+            i++;
             continue;
         }
-        for (i = 0; argv[i] && !ret; i++) {
-            const struct search_option *o;
-            const char *val;
-            int consumed;
-            if (strcmp(argv[i], "-Xclang") == 0
-                || strcmp(argv[i], "-Xpreprocessor") == 0) {
-                i++;
-                continue;
-            }
-            if (!match_search_option(argv, i, &o, &val, &consumed))
-                continue;
-            if (o->group == group)
-                ret = search_list_add(sl, r, val, o->framework);
-            i += consumed;
-        }
-        for (k = 0; search_env[k].name && !ret; k++) {
-            const char *v = getenv(search_env[k].name);
-            if (v && search_env[k].group == group)
-                ret = add_env_path(sl, r, v);
+        if (match_search_option(argv, i, &o, &val, &consumed)) {
+            /* Whether the directory exists decides whether the compiler
+             * lists it, so it is part of the key. */
+            char *opened = val ? (fn ? fn(fn_ctx, val) : strdup(val)) : NULL;
+            struct stat st;
+            char e = opened && stat(opened, &st) == 0 && S_ISDIR(st.st_mode)
+                ? 'd' : '-';
+            free(opened);
+            dcc_sha256_update(&ctx, &e, 1);
+            ret = push_arg(&probe, &n, &cap, argv[i]);
+            if (!ret && consumed)
+                ret = push_arg(&probe, &n, &cap, argv[++i]);
+        } else if (path_flag(argv, i, &takes)) {
+            ret = push_arg(&probe, &n, &cap, argv[i]);
+            if (!ret && takes)
+                ret = push_arg(&probe, &n, &cap, argv[++i]);
         }
     }
+    if (ret || (ret = push_arg(&probe, &n, &cap, "-x"))
+        || (ret = push_arg(&probe, &n, &cap, lang))
+        || (ret = push_arg(&probe, &n, &cap, "-E"))
+        || (ret = push_arg(&probe, &n, &cap, "-v"))
+        || (ret = push_arg(&probe, &n, &cap, "-")))
+        goto out;
+    for (i = 0; i < n; i++)
+        dcc_sha256_update(&ctx, probe[i], strlen(probe[i]) + 1);
+    for (i = 0; env_keys[i]; i++) {
+        const char *v = getenv(env_keys[i]);
+        dcc_sha256_update(&ctx, env_keys[i], strlen(env_keys[i]) + 1);
+        dcc_sha256_update(&ctx, v ? "=" : "-", 1);
+        if (v) {
+            /* Existence of the environment's directories too. */
+            char *copy = strdup(v), *p, *tok;
+            dcc_sha256_update(&ctx, v, strlen(v) + 1);
+            for (p = copy; p && (tok = strsep(&p, ":")) != NULL; ) {
+                char *opened = fn ? fn(fn_ctx, *tok ? tok : ".")
+                    : strdup(*tok ? tok : ".");
+                struct stat st;
+                char e = opened && stat(opened, &st) == 0
+                    && S_ISDIR(st.st_mode) ? 'd' : '-';
+                free(opened);
+                dcc_sha256_update(&ctx, &e, 1);
+            }
+            free(copy);
+        }
+    }
+    dcc_sha256_final(&ctx, dg);
+    for (i = 0; i < DCC_SHA256_LEN; i++)
+        sprintf(keyhex + 2 * i, "%02x", dg[i]);
+
+    fname = probe_cache_fname();
+    if (fname && (f = fopen(fname, "r"))) {
+        while ((len = getline(&line, &lcap, f)) > 0) {
+            if (line[len - 1] != '\n')
+                break;
+            line[len - 1] = '\0';
+            if (strncmp(line, keyhex, DCC_SHA256_HEX_LEN) == 0
+                && line[DCC_SHA256_HEX_LEN] == ' ') {
+                ret = entries_parse(sl, r, line + DCC_SHA256_HEX_LEN + 1);
+                fclose(f);
+                goto out;
+            }
+        }
+        fclose(f);
+    }
+
+    if ((ret = run(run_ctx, probe, &report))) {
+        rs_log_info("mirror: could not ask %s for its search path", argv[0]);
+        goto out;
+    }
+    if ((ret = entries_from_report(report, &entries)))
+        goto out;
+    if (fname && (f = fopen(fname, "a"))) {
+        fprintf(f, "%s %s\n", keyhex, entries);
+        fclose(f);
+    }
+    ret = entries_parse(sl, r, entries);
+
+  out:
     if (ret)
         dcc_search_list_free(sl);
+    free(probe);
+    free(fname);
+    free(line);
+    free(report);
+    free(entries);
     return ret;
 }
 

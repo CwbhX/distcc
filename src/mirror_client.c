@@ -357,8 +357,9 @@ int dcc_mirror_prepare(char **argv, const char *input_fname,
     }
     if ((ret = dcc_mirror_rules_from_env(&job->rules, job->cwd)))
         return ret;
-    if ((ret = dcc_mirror_search_list(argv, input_fname, &job->rules, 1,
-                                      &job->search)))
+    if ((ret = dcc_mirror_search_list(argv, input_fname, &job->rules,
+                                      dcc_mirror_probe_local, NULL,
+                                      NULL, NULL, &job->search)))
         return ret;
     return 0;
 }

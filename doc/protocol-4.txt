@@ -138,10 +138,14 @@ DSTA <len> <bytes>
     of each of those files, and "." (as directories).
 
     Shadow candidates: for each file read (except the input), spelled S
-    relative to the search directory it lies in (the search path includes
-    the compiler's implicit directories, from "<compiler> -E -v"), every
-    S in an earlier search directory, and, if S has a directory part,
-    every S in the directory of a file read, that exists but was not read.
+    relative to the search directory it lies in, every S in an earlier
+    search directory, and, if S has a directory part, every S in the
+    directory of a file read, that exists but was not read.  Both sides
+    take the search path from the compiler: "<compiler> <the job's search
+    and target flags> -x <lang> -E -v -" in the job's cwd and environment
+    (cached per compiler, cwd, flags, environment and which search
+    directories exist).  The server runs this probe confined like the
+    compile.
 
 client check
 ------------

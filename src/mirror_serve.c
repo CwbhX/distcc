@@ -257,6 +257,68 @@ static char *opened_path(const struct dcc_mirror_rules *r, const char *path)
                                   path);
 }
 
+/* Running the compiler's search-path probe on the daemon: the same
+ * confinement, job directory, overlay and TMPDIR as the compile. */
+struct probe_ctx {
+    const char *job_dir;
+    const char *vfs;
+    int in_fd;
+    int confine_failed;
+};
+
+static int probe_confined(void *vctx, char **argv, char **err_ret)
+{
+    struct probe_ctx *pc = vctx;
+    char **args = NULL, *out = NULL, *err = NULL, *saved = NULL;
+    int n = dcc_argv_len(argv), i, ret, failed = 0, status = 0;
+    pid_t pid;
+
+    *err_ret = NULL;
+    if (!(args = calloc((size_t) n + 3, sizeof *args))
+        || asprintf(&out, "%s/probe.out", pc->job_dir) < 0
+        || asprintf(&err, "%s/probe.err", pc->job_dir) < 0) {
+        free(args);
+        return EXIT_OUT_OF_MEMORY;
+    }
+    for (i = 0; i < n; i++)
+        args[i] = argv[i];
+    args[n] = (char *) "-ivfsoverlay";
+    args[n + 1] = (char *) pc->vfs;
+    args[n + 2] = NULL;
+
+    if (getenv("TMPDIR"))
+        saved = strdup(getenv("TMPDIR"));
+    setenv("TMPDIR", pc->job_dir, 1);
+    if (getenv("DISTCC_TESTING_MIRROR_NO_CONFINE")) {
+        failed = 1;
+        ret = EXIT_DISTCC_FAILED;
+    } else {
+        ret = dcc_spawn_confined(args, &pid, "/dev/null", out, err,
+                                 pc->job_dir, &failed);
+    }
+    if (saved)
+        setenv("TMPDIR", saved, 1);
+    else
+        unsetenv("TMPDIR");
+    free(saved);
+    if (failed) {
+        pc->confine_failed = 1;
+        ret = EXIT_DISTCC_FAILED;
+    } else if (!ret) {
+        ret = dcc_collect_child("probe", pid, &status, pc->in_fd);
+        if (!ret && (WIFSIGNALED(status) || WEXITSTATUS(status)))
+            ret = EXIT_DISTCC_FAILED;
+        if (!ret)
+            ret = dcc_load_file_string(err, err_ret);
+    }
+    unlink(out);
+    unlink(err);
+    free(out);
+    free(err);
+    free(args);
+    return ret;
+}
+
 static char *resolve_cb(const void *ctx, const char *path)
 {
     return opened_path((const struct dcc_mirror_rules *) ctx, path);
@@ -639,9 +701,6 @@ int dcc_mirror_serve(int in_fd, int out_fd,
         ret = EXIT_OUT_OF_MEMORY;
         goto out;
     }
-    if (dcc_mirror_search_list(client_argv, *input_ret, &rules, 1, &search))
-        REFUSE(DCC_MIRR_ARG_POLICY, "an include search option or the "
-               "compiler's search path is not supported");
 
     /* Pre-check: synced-tree files must have the client's size and mtime.
      * Installed-tree files are compared by digest after the compile. */
@@ -700,6 +759,31 @@ int dcc_mirror_serve(int in_fd, int out_fd,
         }
         if (ret)
             goto out;
+    }
+
+    /* The include search path, as the compiler reports it.  The probe runs
+     * the client's compiler command, so it is confined like the compile.
+     * (DISTCC_CMDLIST may have renamed the compiler.) */
+    {
+        struct probe_ctx pc;
+        free(client_argv[0]);
+        if (!(client_argv[0] = strdup(argv[0]))) {
+            ret = EXIT_OUT_OF_MEMORY;
+            goto out;
+        }
+        pc.job_dir = job_dir;
+        pc.vfs = argv[dcc_argv_len(argv) - 1];
+        pc.in_fd = in_fd;
+        pc.confine_failed = 0;
+        if (dcc_mirror_search_list(client_argv, *input_ret, &rules,
+                                   probe_confined, &pc, resolve_cb, &rules,
+                                   &search)) {
+            if (pc.confine_failed)
+                REFUSE(DCC_MIRR_NO_CONFINE, "the compiler could not be "
+                       "confined");
+            REFUSE(DCC_MIRR_ARG_POLICY, "an include search option or the "
+                   "compiler's search path is not supported");
+        }
     }
 
     if (getenv("TMPDIR"))

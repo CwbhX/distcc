@@ -328,16 +328,23 @@ filtered out of it, a Homebrew package only the client has), the client's
 own compile would read a different file although every listed file
 matches. Two checks cover this (`src/mirror_search.c`):
 
-- **Shadow candidates.** Both sides compute the include search path in
-  order: `-iquote`; `-I` and `-F` with `CPATH`; `-isystem` and
-  `-iframework` with `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
-  `OBJC_INCLUDE_PATH` and `OBJCPLUS_INCLUDE_PATH`; the compiler's implicit
-  directories (asked from the compiler once with `-E -v` for each compiler
-  binary and set of relevant flags, and cached in `$DISTCC_DIR`); and
-  `-idirafter`. Joined (`-isystemdir`), separate and `=` spellings are all
-  parsed; options the mirror does not model (`-iprefix`, `-iwithprefix*`,
-  `-iwithsysroot`, `-I-`, `-ivfsoverlay`, `-index-header-map`, ...) keep
-  the job off the mirror. For each file read (except the input), spelled S
+- **Shadow candidates.** Both sides take the include search path from the
+  compiler itself: `<compiler> <the job's search and target flags> -x
+  <lang> -E -v -`, run in the job's cwd with its environment (`CPATH`,
+  `C_INCLUDE_PATH` and the language variants included), reports the
+  `"..."` and `<...>` lists in the order the compiler will use, after its
+  own rules for duplicates (with `-Ilate -Iearly -isystem late` it drops the
+  user `late` and searches `early` first), missing directories and its
+  implicit directories. A model of those rules got the duplicate case
+  wrong, so none is kept. The answer is cached in `$DISTCC_DIR`, keyed by
+  the compiler binary's digest, the cwd, the probe, the environment and
+  which search directories exist. On the daemon the probe runs exactly
+  like the compile (confined to the job directory, with the overlay, other
+  descriptors closed), since it runs the client's compiler command. Joined
+  (`-isystemdir`), separate and `=` spellings are all recognized, and
+  options the mirror does not model (`-iprefix`, `-iwithprefix*`,
+  `-iwithsysroot`, `-I-`, `-ivfsoverlay`, `-index-header-map`, header
+  maps, ...) keep the job off the mirror. For each file read (except the input), spelled S
   relative to the search directory it lies in, the candidates are S in
   every earlier search directory and, when S has a directory part (`a/b.h`),
   S in the directory of every file read (a `"..."` include looks in the
@@ -527,7 +534,7 @@ right.
 | A file or a search directory missing from `DSTA` | `MirrorOmittedFile_Case`, `MirrorOmittedDir_Case` |
 | Shadowing: a synced search directory differs | `MirrorShadow_Case` |
 | Same size and mtime, other content (same-second edit) | `MirrorSameSecond_Case` |
-| Nested shadowing (`<sub/val.h>`, `early/sub` on both sides) with `-I`, joined `-isystem`, and `CPATH` | `MirrorNestedShadow_Case`, `MirrorJoinedShadow_Case`, `MirrorCpathShadow_Case` |
+| Nested shadowing (`<sub/val.h>`, `early/sub` on both sides) with `-I`, joined `-isystem`, `CPATH`, and `-Ilate -Iearly -isystem late` (compiler's duplicate rule) | `MirrorNestedShadow_Case`, `MirrorJoinedShadow_Case`, `MirrorCpathShadow_Case`, `MirrorDedupOrderShadow_Case` |
 | The same duplicate on both sides is accepted | `MirrorDuplicateHarmless_Case` |
 | `-MF -` keeps dependencies on stdout (classic path) | `MirrorDepsStdout_Case` |
 | Unsupported search option (`-iprefix`) is not mirrored | `MirrorRefusedOption_Case` |
@@ -537,7 +544,7 @@ right.
 | cwd outside every root (`MIRR 1`) | `MirrorOutsideRoot_Case` |
 | Forwarded environment (`CPATH`) | `MirrorEnv_Case` |
 | Path map used / refused when it names another directory | `MirrorPathmap_Case`, `MirrorBadPathmap_Case` |
-| Compiler writes in the mirror and next to it are denied | `MirrorConfined_Case` |
+| Compiler writes in the mirror and next to it are denied, for the compile and for the daemon's search-path probe | `MirrorConfined_Case` |
 | `--mirror-root` refuses to start with `--enable-tcp-insecure` or a failing probe | `MirrorStartRefused_Case` |
 | SHA-256, `.d` escapes, DSTA parsing | `MirrorHelper_Case` |
 

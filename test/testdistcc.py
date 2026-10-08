@@ -2621,6 +2621,13 @@ class MirrorCpathShadow_Case(MirrorShadowBase_Case):
         MirrorShadowBase_Case.teardown(self)
 
 
+class MirrorDedupOrderShadow_Case(MirrorShadowBase_Case):
+    """-Ilate -Iearly -isystem late: clang drops the -I occurrence of late
+    and searches early first, so early/sub/val.h shadows late/sub/val.h."""
+    def search_opts(self):
+        return "-Ilate -Iearly -isystem late"
+
+
 class MirrorDuplicateHarmless_Case(MirrorShadowBase_Case):
     """The same early duplicate on both sides is not a shadow."""
     def daemon_env(self):
@@ -2754,13 +2761,22 @@ class MirrorConfined_Case(Mirror_Case):
         real = os.path.realpath(self._cc)
         self.outside = [os.path.join(os.getcwd(), "written_in_mirror"),
                         os.getcwd() + "_written_outside"]
+        self.probe_outside = [os.path.join(os.getcwd(), "probe_in_mirror"),
+                              os.getcwd() + "_probe_outside"]
         script = os.path.join(os.getcwd(), "writecc")
         f = open(script, "w")
         # Only the compile of testtmp.c tries to write; not the local PCH
         # build or link, and not a classic-path compile of a .i file.
+        # The compile of testtmp.c, and the daemon's search-path probe
+        # (the daemon runs with its own DISTCC_DIR), try to write; the
+        # local PCH build, link, client-side probe and classic .i compile
+        # do not.
         f.write("#!/bin/sh\n"
                 "case \"$*\" in *.i\\ *|*.i|*-x\\ c-header*) ;; "
-                "*testtmp.c*)\n")
+                "*-E\\ -v*) case \"$DISTCC_DIR\" in *daemon_distccdir*)\n")
+        for path in self.probe_outside:
+            f.write("  { echo x > '%s'; } 2>/dev/null\n" % path)
+        f.write("  ;; esac ;;\n*testtmp.c*)\n")
         for path in self.outside:
             f.write("  { echo x > '%s'; } 2>/dev/null\n" % path)
         f.write("  ;; esac\nexec '%s' \"$@\"\n" % real)
@@ -2776,9 +2792,20 @@ class MirrorConfined_Case(Mirror_Case):
         self.link()
         self.checkBuiltProgram()
         self.mirror_expect(self.client_log())
-        for path in self.outside:
+        for path in self.outside + self.probe_outside:
             if os.path.exists(path):
                 self.fail("confined compiler wrote %s" % path)
+        # The daemon did run its own probe.
+        if not os.path.exists(os.path.join(self.daemon_ddir,
+                                           "mirror-searchpath")):
+            self.fail("the daemon did not probe the search path")
+    def daemon_env(self):
+        # Its own DISTCC_DIR, so that it cannot use the client's cached
+        # search path and has to run the probe.
+        self.daemon_ddir = os.path.abspath("daemon_distccdir")
+        if not os.path.isdir(self.daemon_ddir):
+            os.mkdir(self.daemon_ddir)
+        return {'DISTCC_DIR': self.daemon_ddir}
 
 
 class MirrorStartRefused_Case(SimpleDistCC_Case):
@@ -2877,6 +2904,7 @@ tests = [
          MirrorNestedShadow_Case,
          MirrorJoinedShadow_Case,
          MirrorCpathShadow_Case,
+         MirrorDedupOrderShadow_Case,
          MirrorDuplicateHarmless_Case,
          MirrorDepsStdout_Case,
          MirrorRefusedOption_Case,

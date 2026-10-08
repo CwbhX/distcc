@@ -39,9 +39,15 @@ struct dcc_search_list {
 /* Maps a path to the one to open on this side; returns malloc'd. */
 typedef char *(*dcc_mirror_resolve_fn)(const void *ctx, const char *path);
 
+/* Runs a compiler probe and returns its stderr (malloc'd). */
+typedef int (*dcc_mirror_probe_fn)(void *ctx, char **argv, char **err_ret);
+
 int dcc_mirror_check_search_options(char **argv);
+int dcc_mirror_probe_local(void *ctx, char **argv, char **err_ret);
 int dcc_mirror_search_list(char **argv, const char *input,
-                           const struct dcc_mirror_rules *r, int implicit,
+                           const struct dcc_mirror_rules *r,
+                           dcc_mirror_probe_fn run, void *run_ctx,
+                           dcc_mirror_resolve_fn fn, const void *fn_ctx,
                            struct dcc_search_list *sl);
 void dcc_search_list_free(struct dcc_search_list *sl);
 int dcc_mirror_shadow_candidates(const struct dcc_search_list *sl,
