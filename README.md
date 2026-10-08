@@ -10,24 +10,51 @@ Mac minis joined by a Thunderbolt bridge. It is based on
 commits). Without the new options it behaves like upstream distcc and talks
 to upstream daemons.
 
+- [Quick start](#quick-start)
 - [What's new in this fork](#whats-new-in-this-fork)
 - [Results](#results)
 - [How the three modes work](#how-the-three-modes-work)
 - [Installing](#installing)
-- [Using it](#using-it)
+- [Setting up a project](#setting-up-a-project)
+- [Building](#building)
+- [distcc-mirror commands](#distcc-mirror-commands)
+- [Doing it by hand](#doing-it-by-hand)
 - [Configuration reference](#configuration-reference)
 - [Troubleshooting](#troubleshooting)
 - [Running the tests](#running-the-tests)
 - [Further documentation](#further-documentation)
+
+## Quick start
+
+Two Macs: the **client** runs your builds, and the **helper** (here the ssh
+host `m6`) lends its cores. On the client:
+
+```sh
+git clone -b mac-pool-perf https://github.com/CwbhX/distcc.git && cd distcc
+brew install autoconf automake pkgconf popt
+contrib/distcc-mirror install --helper m6        # build; install here and on m6
+export PATH="$HOME/.local/distcc-mirror/bin:$PATH"
+
+cd ~/src/MyProject                               # a CMake + Ninja project
+distcc-mirror init --helper m6 --build build     # writes ~/.config/distcc-mirror/myproject.conf
+distcc-mirror helper install                     # starts the daemon on m6 (LaunchAgent)
+distcc-mirror doctor                             # checks that both Macs match
+distcc-mirror build                              # PCHs, sync to m6, ninja
+```
+
+Every step works out the details itself (addresses, slot counts, ccache,
+build directories behind symlinks), and `doctor` tells you what to fix.
 
 ## What's new in this fork
 
 | Feature | What it does |
 |---|---|
 | **Mirrored-tree mode** (`,mirror`, protocol 4) | A helper that has a copy of the source tree at the same path compiles in that copy. The client sends no source and runs no preprocessor. It accepts the object only after it checks that every file and directory the compile used is identical on both machines. Precompiled headers (PCHs) work remotely. |
+| **`distcc-mirror`** | One command for the whole setup: install on both Macs, write a project config, run the helper daemon as a LaunchAgent, check that the machines match, sync, build, and test-compile against local results. |
 | **`distcc --mirror-sync`** | Copies the working tree to the mirror helpers with rsync. Uncommitted edits are included, and no git is involved. Build trees are filtered to sources, headers and PCHs. |
 | **Write confinement** | On the helper, each mirrored compile runs in a macOS Seatbelt sandbox. It can write only to its own job directory and has no network access. The daemon refuses to start in mirror mode if confinement doesn't work. |
 | **Safe fallback** | If a check fails, the helper refuses, or the compile fails in the mirror, the job is sent the classic way to the same helper. The helper is not marked bad, and the build never uses an object it can't trust. |
+| **CMake PCHs in classic mode** | CMake's `-Xclang -include-pch` flags are no longer sent with preprocessed source, where they made every remote compile fail and back the helper off. No wrapper script is needed. |
 | **Faster slot scheduling** | When every slot is busy, a job now waits in the kernel on a busy slot instead of sleeping for a second and polling. A freed slot is used right away. |
 | **Separate preprocessor locks** | Local preprocessor slots (`--localslots_cpp`) have their own locks, so a job holding a remote slot isn't stuck waiting behind local compiles. |
 | **PCH generation stays local** | Jobs that build a PCH (`-x c++-header`, `-emit-pch`, ...) run on the client automatically. |
@@ -67,199 +94,268 @@ an unsupported option, or a file differs) falls back to classic mode.
 
 ## Installing
 
-Install the same build on **every machine**: the client (where you run the
-build) and each helper.
-
 ### Prerequisites
 
-macOS (Apple silicon), with the Xcode Command Line Tools and Homebrew:
+On every Mac (Apple silicon): the Xcode Command Line Tools, and on the
+client Homebrew with the build tools:
 
 ```sh
 xcode-select --install
-brew install autoconf automake pkgconf popt python-setuptools
+brew install autoconf automake pkgconf popt     # client only
 ```
 
-Debian or Ubuntu (classic and pump mode only; see the note below):
+The helper needs no Homebrew for distcc itself (popt is linked in
+statically), only for the libraries your project includes.
+
+Mirror mode needs a macOS **helper**, because write confinement uses
+Seatbelt. On Linux, classic and pump mode build as usual (`sudo apt-get
+install gcc make python3 python3-dev python3-setuptools autoconf pkg-config
+libpopt-dev`, then the manual steps below).
+
+### Install
+
+From the source tree, on the client:
 
 ```sh
-sudo apt-get install gcc make python3 python3-dev python3-setuptools autoconf pkg-config libpopt-dev
+contrib/distcc-mirror install --helper m6
 ```
 
-> Mirror mode needs a macOS **helper**, because write confinement uses
-> Seatbelt. On other systems the daemon refuses `--mirror-root`, and the
-> mirror tests are skipped.
+This runs `autogen.sh` and `configure` if needed, builds with popt linked
+statically, and installs into `~/.local/distcc-mirror`. That includes
+`distcc`, `distccd`, the `distcc-mirror` tool and the compiler whitelist
+the daemon requires. It then copies the install to each `--helper` over
+ssh. Run it again after pulling changes; once a project is set up, it
+copies to that project's helpers and restarts their daemons. Add
+`~/.local/distcc-mirror/bin` to your `PATH`.
 
-### Build and install
+Options: `--prefix DIR`, `--pump` (also build pump mode),
+`--no-build` (only copy what is built), `--local-only`.
+
+<details>
+<summary>Building and installing by hand</summary>
 
 ```sh
-git clone -b mac-pool-perf https://github.com/CwbhX/distcc.git
-cd distcc
 ./autogen.sh
 ./configure --prefix="$HOME/.local/distcc-mirror" --disable-pump-mode
-make LIBS="$(brew --prefix popt)/lib/libpopt.a -liconv"   # links popt statically
+make LIBS="$(brew --prefix popt)/lib/libpopt.a -liconv"   # popt linked statically
 make install
-```
-
-Notes:
-
-- Linking popt statically means the binaries don't need Homebrew's popt at
-  runtime. You can then build once and copy `~/.local/distcc-mirror` to the
-  other Mac:
-
-  ```sh
-  rsync -a ~/.local/distcc-mirror/ helper:.local/distcc-mirror/
-  ```
-
-  On Linux, a plain `make` is enough.
-- Leave out `--disable-pump-mode` if you want pump mode.
-- A separate prefix lets this build live next to Homebrew's `distcc`
-  without replacing it.
-
-The daemon only runs compilers that are in its whitelist directory
-(`<prefix>/lib/distcc`). Create the whitelist on each helper:
-
-```sh
-mkdir -p ~/.local/distcc-mirror/lib/distcc
+mkdir -p ~/.local/distcc-mirror/lib/distcc                # compiler whitelist
 for c in cc c++ gcc g++ clang clang++; do
   ln -sf ../../bin/distcc ~/.local/distcc-mirror/lib/distcc/$c
 done
+rsync -a ~/.local/distcc-mirror/ m6:.local/distcc-mirror/  # same build on the helper
 ```
 
-(`update-distcc-symlinks` does the same for a system-wide install.)
+On Linux a plain `make` is enough. Leave out `--disable-pump-mode` to get
+pump mode.
 
-### Making the helper identical (mirror mode)
+</details>
 
-Mirror mode only accepts a remote object when every file the compile read
-is identical on both machines. This includes the toolchain and the
-installed headers:
+## Setting up a project
 
-- **Compiler:** the same Command Line Tools or Xcode version on both Macs.
-  Check with `clang --version` and `pkgutil --pkg-info=com.apple.pkg.CLTools_Executables`.
-  If they differ, every job falls back with "compiler differs" (`MIRR 6`).
-- **Homebrew:** the same formulae at the same versions, for every library
-  the build includes headers from. `brew install` installs the newest
-  version, which may not match the client's. To get the exact versions,
-  copy the kegs from the client's Cellar, then `brew link` and `brew pin`
-  them on the helper. Upgrade both Macs together.
-- **Paths:** each synced tree must be at the same absolute path on both
-  machines. If your client's build directory is reached through another
-  path, such as a symlink to an external disk, use
-  `DISTCC_MIRROR_PATHMAP` (see below).
+### 1. Write the config
 
-A mismatch is never a correctness problem: the job falls back to classic
-mode. It only costs speed, and the client's log says why.
-
-## Using it
-
-### Classic mode (as in upstream)
+From inside the project:
 
 ```sh
-# On each helper
-distccd --daemon --allow 192.168.1.0/24 --jobs 12
-
-# On the client
-export DISTCC_HOSTS="helper/12 localhost/8"
-make -j20 CC="distcc clang" CXX="distcc clang++"
+distcc-mirror init --helper m6 --build build
 ```
 
-### Mirror mode
+This writes `~/.config/distcc-mirror/<project>.conf`. Nothing is written
+into the project itself. `init` works out:
 
-**1. Start the daemon on the helper** with the roots it may compile in.
-Only clients allowed by `--allow` can connect; `--enable-tcp-insecure` is
-refused in mirror mode.
+- the root (the git work tree);
+- the helper's address, from your ssh config;
+- slot counts: cores + 2 on each machine;
+- this Mac's address as the helper sees it;
+- other build directories to leave out of the sync;
+- whether the build uses ccache. If it does, `CCACHE_PREFIX` is set to
+  distcc. If the build has no compiler launcher at all, `init` prints the
+  `cmake` line that adds one.
+
+Useful options:
+
+| Option | Meaning |
+|---|---|
+| `--helper SSH[=ADDR][/SLOTS]` | A helper (repeatable). For example, `m6=172.31.250.2/14`. |
+| `--extra DIRS` | More trees to sync whole, such as dependencies you built locally. |
+| `--exclude NAMES` | More top-level names not to sync, such as `output:tmp`. |
+| `--local-jobs N`, `--port N` | Slots on this Mac; the daemon port (default 3634). |
+| `--set KEY=VALUE` | Any other variable to export to the build. |
+
+The config is plain `KEY=VALUE`, so edit it freely. With several projects,
+the commands pick the config whose root contains the current directory, or
+take `-c NAME`. Here is an example:
+
+```sh
+ROOTS=~/Git/MyProject
+BUILD_DIR=~/Git/MyProject/build-dev     # may be a symlink to another disk
+EXCLUDE=.git:build-release
+EXTRA=~/deps/wxwidgets-dest
+HELPERS="m6=172.31.250.2/14"
+LOCAL_JOBS=17
+PORT=3634
+CLIENT_ADDR=172.31.250.1
+PREFIX=~/.local/distcc-mirror
+CCACHE_PREFIX=~/.local/distcc-mirror/bin/distcc
+```
+
+### 2. Start the helper daemon
+
+```sh
+distcc-mirror helper install
+```
+
+This installs a LaunchAgent on each helper, so the daemon survives
+reboots. It is configured with `--allow` for this Mac only, the project
+roots as `--mirror-root`s, and its own log file. If several project
+configs name the same helper, one daemon serves all their roots. A daemon
+you started by hand on the same port is replaced. Manage it with
+`distcc-mirror helper status|log|restart|stop|start|uninstall`.
+
+### 3. Check that both Macs match
+
+```sh
+distcc-mirror doctor
+```
+
+`doctor` checks this Mac and each helper, and prints the fix for every
+problem it finds:
+
+- the same distcc build and compiler (Command Line Tools) on both;
+- the same SDK and architecture;
+- the roots present on the helper;
+- the daemon running and reachable;
+- ccache wired to distcc;
+- Homebrew formulae and `/opt/homebrew/include` the same on both.
+
+Mirror mode only accepts a remote object when every file the compile read
+is identical on both machines, so these matter. A mismatch is never a
+correctness problem, though: the jobs fall back and only speed suffers.
+
+**Homebrew:** `brew install` on the helper installs the newest versions,
+which may not match yours. Use this instead:
+
+```sh
+distcc-mirror brew-parity           # what differs
+distcc-mirror brew-parity --apply   # copy the missing kegs at your versions, link and pin them
+```
+
+`--apply --different` also replaces kegs that are at other versions on the
+helper. Afterwards, upgrade both Macs together.
+
+**Compiler:** install the same Command Line Tools (or Xcode) version on
+both. Otherwise every job falls back with "compiler differs" (`MIRR 6`).
+
+## Building
+
+```sh
+distcc-mirror build                 # PCHs, sync, ninja -j<all slots>
+distcc-mirror build -- my_target    # arguments after -- go to ninja
+distcc-mirror test -n 10            # compile 10 random files on the helper and compare with local compiles
+```
+
+`build` first builds the precompiled headers locally, because the helper
+compiles against copies of them. Then it syncs the tree (about 3 s when
+little changed, 11 s for a first copy of 2 GB over Thunderbolt), and runs
+ninja with as many jobs as all the slots together. It accepts `--no-sync`,
+`--no-pch` and `-C DIR`. For Make projects it runs `make` instead (there is
+no PCH step).
+
+For other build commands, use the same environment:
+
+```sh
+distcc-mirror sync && distcc-mirror run -- make -j31
+eval "$(distcc-mirror env)"         # or put it in your shell
+distcc-mirror shell                 # a subshell with it
+```
+
+`test` is the quickest way to see whether mirror mode works for a project.
+For each file it shows whether it was mirrored, rejected or refused, and
+why. It also shows whether the object is byte-identical to a local
+compile. Nothing is written into the project.
+
+## distcc-mirror commands
+
+| Command | What it does |
+|---|---|
+| `install [--helper SSH]` | Build distcc from this source tree and install it here and on the helpers |
+| `init --helper SSH [--build DIR]` | Write a config for the project in the current directory |
+| `helper install\|status\|log\|restart\|stop\|start\|uninstall` | Manage the daemon on the helpers |
+| `doctor` | Check this Mac and the helpers, with fixes |
+| `brew-parity [--apply]` | Compare Homebrew with the helpers; copy missing kegs |
+| `sync` | Copy the tree to the helpers (`distcc --mirror-sync`) |
+| `build [-- NINJA ARGS]` | PCHs, sync, ninja |
+| `test [-n N] [--match TEXT]` | Compile a few files on the helper; compare with local compiles |
+| `show` | Print the config and the environment it gives |
+| `env`, `run CMD`, `shell` | Use that environment for anything else |
+
+`distcc-mirror COMMAND --help` lists every option.
+
+## Doing it by hand
+
+`distcc-mirror` only writes a LaunchAgent and runs the commands below.
+Here they are, if you want to see or script them yourself.
+
+<details>
+<summary>Helper daemon, client environment, sync and build</summary>
+
+On the helper (`--enable-tcp-insecure` is refused in mirror mode; a
+different port lets it run next to an upstream daemon on 3632):
 
 ```sh
 ~/.local/distcc-mirror/bin/distccd --daemon \
   --listen 172.31.250.2 --port 3634 --allow 172.31.250.1/32 \
-  --jobs 14 \
-  --mirror-root "$HOME/Git/MyProject" \
-  --log-file ~/Library/Logs/distccd-mirror.log \
-  --pid-file ~/.local/distcc-mirror/distccd.pid
+  --jobs 14 --mirror-root "$HOME/Git/MyProject" \
+  --log-file ~/Library/Logs/distccd-mirror.log
 ```
 
-The daemon starts by checking that it can confine a compiler. If it can't,
-it refuses to start. A different port lets it run next to an existing
-upstream daemon on 3632.
+The daemon first checks that it can confine a compiler, and refuses to
+start if it can't. Add `--no-detach` when running it under launchd.
 
-To keep it running across reboots, use a LaunchAgent
-(`~/Library/LaunchAgents/local.distccd-mirror.plist`, then
-`launchctl load` it):
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>local.distccd-mirror</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Users/YOU/.local/distcc-mirror/bin/distccd</string>
-    <string>--daemon</string><string>--no-detach</string>
-    <string>--listen</string><string>172.31.250.2</string>
-    <string>--port</string><string>3634</string>
-    <string>--allow</string><string>172.31.250.1/32</string>
-    <string>--jobs</string><string>14</string>
-    <string>--mirror-root</string><string>/Users/YOU/Git/MyProject</string>
-    <string>--log-file</string><string>/Users/YOU/Library/Logs/distccd-mirror.log</string>
-  </array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-</dict>
-</plist>
-```
-
-**2. Configure the client:**
+On the client:
 
 ```sh
 export PATH="$HOME/.local/distcc-mirror/bin:$PATH"
 export DISTCC_HOSTS="172.31.250.2:3634/14,mirror localhost/17"
 export DISTCC_MIRROR_ROOTS="$HOME/Git/MyProject"
-export DISTCC_MIRROR_EXCLUDE=".git:build-release:tmp"   # not synced, not compared
-export DISTCC_MIRROR_SSH=m6                              # ssh destination(s) for the sync
-```
+export DISTCC_MIRROR_EXCLUDE=".git:build-release"
+export DISTCC_MIRROR_PATHMAP="/Volumes/SSD/MyProject/build=$HOME/Git/MyProject/build"
+export DISTCC_MIRROR_SSH=m6
+export CCACHE_PREFIX=distcc          # if the build uses ccache
 
-**3. Build.** Build the PCHs and generated headers first (the helper
-compiles against copies of them), then sync, then run the build:
-
-```sh
-ninja -C build <pch targets>
+ninja -C build <pch targets>         # the helper compiles against copies of them
 distcc --mirror-sync
 ninja -C build -j31
 ```
 
-For CMake/Ninja trees,
-[`contrib/mirror-build.sh`](contrib/mirror-build.sh) does all three:
+[`contrib/mirror-build.sh`](contrib/mirror-build.sh) does the last three
+steps for a CMake/Ninja tree.
+
+`DISTCC_MIRROR_PATHMAP` marks the build directory as a build tree, so only
+its sources, headers and PCHs are synced and compared. It also maps the
+build directory when it physically lives elsewhere, such as through a
+symlink to another disk. The client checks that both paths are the same
+directory (same device and inode), then sends the logical path. The helper
+compiles through a clang VFS overlay, so the `.d` files and PCH paths come
+out the same as on the client.
+
+</details>
+
+### Classic mode (as in upstream)
 
 ```sh
-contrib/mirror-build.sh build -j31
+distccd --daemon --allow 192.168.1.0/24 --jobs 12        # on each helper
+export DISTCC_HOSTS="helper/12 localhost/8"              # on the client
+make -j20 CC="distcc clang" CXX="distcc clang++"
 ```
-
-A sync with no changes takes about 3 s. The first copy of a 2 GB tree took
-11 s over Thunderbolt.
-
-**With ccache:** set `CCACHE_PREFIX=distcc` (or a wrapper script that runs
-distcc). Mirror mode works with ccache's `base_dir`, `depend_mode` and
-`-fpch-preprocess`.
-
-**Build directory under another path:** if the build runs in
-`/Volumes/SSD/MyProject/build`, but the helper has the tree at
-`~/Git/MyProject`, map one to the other:
-
-```sh
-export DISTCC_MIRROR_PATHMAP="/Volumes/SSD/MyProject/build=$HOME/Git/MyProject/build"
-```
-
-The client checks that both paths are the same directory (same device and
-inode). It then sends the logical path. The helper compiles through a clang
-VFS overlay, so the `.d` files and PCH paths come out the same as on the
-client.
 
 ### Choosing slot counts
 
 On the M5 Pro + M6 pair, the best result came from a few more slots than
 cores on the helper (14 on 12 cores) and on the client (`localhost/17` on
-15 cores). Going past that didn't help. Watch `distccmon-text 1` during a
-build to see where jobs are running.
+15 cores). Going past that didn't help. `init` picks cores + 2. Watch
+`distccmon-text 1` during a build to see where jobs are running.
 
 ## Configuration reference
 
@@ -294,19 +390,24 @@ build to see where jobs are running.
 | Command | Meaning |
 |---|---|
 | `distcc --mirror-sync [HOST...]` | Copy the roots, build trees and extra trees to the given hosts, or to `DISTCC_MIRROR_SSH`. Files deleted locally are deleted on the helper too. |
+| `distcc-mirror ...` | The setup tool; see [distcc-mirror commands](#distcc-mirror-commands). |
 
 ## Troubleshooting
 
-- **See what happened to each job:** run with `DISTCC_VERBOSE=1`
+- **Start with** `distcc-mirror doctor`, then `distcc-mirror test -n 10`.
+  `test` shows, per file, whether it was mirrored and why not.
+- **See what happened to each job in a build:** run with `DISTCC_VERBOSE=1`
   (or set `DISTCC_LOG`). For mirror jobs, the log shows whether the job was
   accepted, or which check failed and why it fell back.
+- **Helper daemon:** `distcc-mirror helper status` and
+  `distcc-mirror helper log`.
 - **Daemon side:** add `--log-level debug` and read the `--log-file`.
 - **Every job falls back with a refusal code** (`MIRR`):
 
   | Code | Meaning | Usual fix |
   |---|---|---|
   | 1 | The cwd or input is not under a `--mirror-root` | Check `--mirror-root` and `DISTCC_MIRROR_ROOTS` |
-  | 2 | A file on the check list differs | Run `distcc --mirror-sync` (rebuild PCHs first) |
+  | 2 | A file on the check list differs | `distcc-mirror sync` (rebuild PCHs first; `distcc-mirror build` does both) |
   | 3 | The argument or compiler is refused | The job uses an unsupported search option (`-iprefix`, `-ivfsoverlay`, ...) |
   | 4 | The cwd or input is missing on the helper | Sync, or fix the path map |
   | 5 | Confinement failed on the helper | Check the daemon log |
@@ -315,7 +416,8 @@ build to see where jobs are running.
 - **Some jobs are rejected after compiling:** a header or a search directory
   differs between the machines. Usually that's an installed library (such
   as a Homebrew formula) at another version on the helper. The verbose log
-  names the path.
+  and `distcc-mirror test` name the path; `distcc-mirror brew-parity` fixes
+  Homebrew differences.
 - **Caches:** `$DISTCC_DIR/mirror-digests` (file digests) and
   `$DISTCC_DIR/mirror-searchpath` (the compiler's search paths) can be
   deleted at any time.

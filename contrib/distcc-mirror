@@ -1,0 +1,1574 @@
+#!/usr/bin/env python3
+#
+# Copyright 2026 Clement Hathaway
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+"""distcc-mirror: set up and run distcc's mirrored-tree mode.
+
+One config file per project (~/.config/distcc-mirror/<name>.conf) holds
+everything: the source roots, the build directory, the helpers.  The
+commands below read it, so no environment variables have to be set by hand.
+
+Getting started, on the machine that runs the builds:
+
+  contrib/distcc-mirror install --helper m6       build, install here and on m6
+  distcc-mirror init --helper m6 --build build    write the project's config
+  distcc-mirror helper install                    start the daemon on m6 (LaunchAgent)
+  distcc-mirror doctor                            check both machines match
+  distcc-mirror build                             PCHs, sync, ninja
+
+Commands:
+  install      build distcc from this source tree, install it here and on
+               the helpers
+  init         write a config for a project
+  show         print the config and the environment it gives
+  env          print export lines:  eval "$(distcc-mirror env)"
+  run CMD...   run a command with that environment
+  shell        start a shell with that environment
+  sync         copy the tree to the helpers (distcc --mirror-sync)
+  build        build PCHs, sync, then run ninja (or make)
+  test         compile a few files through the mirror and compare the
+               objects with local compiles
+  doctor       check the setup on this machine and the helpers
+  helper       install/start/stop/restart/status/log/uninstall the helper
+               daemon
+  brew-parity  compare Homebrew between this machine and the helpers, and
+               copy missing kegs
+
+Run "distcc-mirror COMMAND --help" for the options of each command.
+"""
+
+import argparse
+import glob
+import json
+import os
+import platform
+import plistlib
+import random
+import re
+import shlex
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME")
+                          or os.path.join(HOME, ".config"), "distcc-mirror")
+DEFAULT_PREFIX = os.path.join(HOME, ".local", "distcc-mirror")
+DEFAULT_PORT = 3634
+LABEL_BASE = "local.distcc-mirror.distccd"
+WHITELIST = ("cc", "c++", "gcc", "g++", "clang", "clang++")
+BREW = "/opt/homebrew"
+
+# Keys the tool interprets; every other key in a config is exported to the
+# build as is (CCACHE_PREFIX, ...).
+KNOWN_KEYS = {
+    "ROOTS", "BUILD_DIR", "EXCLUDE", "EXTRA", "HELPERS", "LOCAL_JOBS",
+    "PORT", "CLIENT_ADDR", "PREFIX", "PATHMAP", "INSTALLED", "RSH",
+    "DAEMON_ARGS",
+}
+
+
+# ---------------------------------------------------------------- output
+
+_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+def _c(code, text):
+    return "\033[%sm%s\033[0m" % (code, text) if _COLOR else text
+
+
+def info(msg):
+    print(msg, flush=True)
+
+
+def step(msg):
+    print(_c("1", "==> ") + _c("1", msg), flush=True)
+
+
+def die(msg, code=1):
+    print(_c("31", "error: ") + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+class Report:
+    """Collects ok / warning / problem lines for doctor and friends."""
+
+    def __init__(self):
+        self.problems = 0
+        self.warnings = 0
+
+    def ok(self, msg):
+        info("  %s %s" % (_c("32", "ok"), msg))
+
+    def warn(self, msg, fix=None):
+        self.warnings += 1
+        info("  %s %s" % (_c("33", "!!"), msg))
+        if fix:
+            info("     " + _c("2", "-> " + fix))
+
+    def fail(self, msg, fix=None):
+        self.problems += 1
+        info("  %s %s" % (_c("31", "XX"), msg))
+        if fix:
+            info("     " + _c("2", "-> " + fix))
+
+
+# ---------------------------------------------------------------- helpers
+
+def tilde(path):
+    """Shorten a path under $HOME to ~/... for display and configs."""
+    if path == HOME:
+        return "~"
+    if path.startswith(HOME + "/"):
+        return "~" + path[len(HOME):]
+    return path
+
+
+def home_relative(path):
+    """A path as rsync/ssh want it on another machine: relative to the
+    home directory when it is under ours, else absolute."""
+    if path.startswith(HOME + "/"):
+        return path[len(HOME) + 1:]
+    return path
+
+
+def split_colon(value):
+    return [p for p in (value or "").split(":") if p]
+
+
+def under(path, root):
+    path, root = path.rstrip("/"), root.rstrip("/")
+    return path == root or path.startswith(root + "/")
+
+
+def ncpu():
+    return os.cpu_count() or 4
+
+
+def run(cmd, **kw):
+    """Run a command, echoing it; exit if it fails."""
+    info(_c("2", "$ " + " ".join(shlex.quote(c) for c in cmd)))
+    r = subprocess.run(cmd, **kw)
+    if r.returncode != 0:
+        die("%s failed (exit %d)" % (cmd[0], r.returncode), r.returncode)
+    return r
+
+
+# ---------------------------------------------------------------- config
+
+def _expand(value, values):
+    def var(m):
+        name = m.group(1) or m.group(2)
+        return values.get(name, os.environ.get(name, m.group(0)))
+    value = re.sub(r"\$\{(\w+)\}|\$(\w+)", var, value)
+    return re.sub(r"(^|[:= ])~(?=/|$|[: ])",
+                  lambda m: m.group(1) + HOME, value)
+
+
+def parse_config_file(path):
+    values = {}
+    with open(path) as f:
+        for n, line in enumerate(f, 1):
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("export "):
+                s = s[7:].lstrip()
+            m = re.match(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)$", s)
+            if not m:
+                die("%s:%d: expected KEY=VALUE" % (path, n))
+            try:
+                parts = shlex.split(m.group(2), comments=True)
+            except ValueError as e:
+                die("%s:%d: %s" % (path, n, e))
+            values[m.group(1)] = _expand(" ".join(parts), values)
+    return values
+
+
+class Helper:
+    def __init__(self, spec, port):
+        m = re.match(r"^([^=/\s]+)(?:=([^/\s]+))?(?:/(\d+))?$", spec)
+        if not m:
+            die("bad helper %r: expected ssh-name[=address][/slots]" % spec)
+        self.ssh = m.group(1)
+        self.addr = m.group(2) or ssh_hostname(m.group(1))
+        self.jobs = int(m.group(3) or 8)
+        self.port = port
+
+    def spec(self):
+        return "%s=%s/%d" % (self.ssh, self.addr, self.jobs)
+
+    def hostspec(self):
+        return "%s:%d/%d,mirror" % (self.addr, self.port, self.jobs)
+
+
+class Config:
+    def __init__(self, path):
+        self.path = path
+        self.name = os.path.basename(path)[:-len(".conf")]
+        v = self.values = parse_config_file(path)
+        self.roots = [os.path.abspath(r)
+                      for r in split_colon(v.get("ROOTS") or v.get("ROOT"))]
+        self.build_dir = os.path.abspath(v["BUILD_DIR"]) \
+            if v.get("BUILD_DIR") else ""
+        self.exclude = v.get("EXCLUDE", ".git")
+        self.extra = split_colon(v.get("EXTRA"))
+        self.prefix = os.path.abspath(v.get("PREFIX") or DEFAULT_PREFIX)
+        self.port = int(v.get("PORT") or DEFAULT_PORT)
+        self.local_jobs = int(v.get("LOCAL_JOBS") or ncpu() + 2)
+        self.client_addr = v.get("CLIENT_ADDR", "")
+        self.installed = v.get("INSTALLED", "")
+        self.rsh = v.get("RSH", "")
+        self.daemon_args = shlex.split(v.get("DAEMON_ARGS", ""))
+        self.helpers = [Helper(h, self.port)
+                        for h in v.get("HELPERS", "").split()]
+        if "PATHMAP" in v:
+            self.pathmap = v["PATHMAP"]
+        elif self.build_dir:
+            # The build dir as written (logical) is what the helpers have;
+            # where it really is here (physical) may differ, e.g. through a
+            # symlink to another disk.  Mapping it, even onto itself, also
+            # marks it as a build tree: only sources, headers and PCHs in it
+            # are synced and compared.
+            self.pathmap = "%s=%s" % (os.path.realpath(self.build_dir),
+                                      self.build_dir)
+        else:
+            self.pathmap = ""
+        self.extra_env = {k: val for k, val in v.items()
+                          if k not in KNOWN_KEYS and k != "ROOT"}
+        if not self.roots:
+            die("%s: ROOTS is not set" % path)
+        if not self.helpers:
+            die("%s: HELPERS is not set" % path)
+
+    def bindir(self):
+        return os.path.join(self.prefix, "bin")
+
+    def distcc(self):
+        return os.path.join(self.bindir(), "distcc")
+
+    def total_jobs(self):
+        return self.local_jobs + sum(h.jobs for h in self.helpers)
+
+    def hosts(self):
+        return " ".join([h.hostspec() for h in self.helpers]
+                        + ["localhost/%d" % self.local_jobs])
+
+    def env(self):
+        """The variables the build needs (PATH first)."""
+        e = {}
+        path = os.environ.get("PATH", "")
+        parts = [p for p in path.split(":") if p and p != self.bindir()]
+        e["PATH"] = ":".join([self.bindir()] + parts)
+        e["DISTCC_HOSTS"] = self.hosts()
+        e["DISTCC_MIRROR_ROOTS"] = ":".join(self.roots)
+        e["DISTCC_MIRROR_EXCLUDE"] = self.exclude
+        if self.pathmap:
+            e["DISTCC_MIRROR_PATHMAP"] = self.pathmap
+        if self.extra:
+            e["DISTCC_MIRROR_EXTRA"] = ":".join(self.extra)
+        e["DISTCC_MIRROR_SSH"] = " ".join(h.ssh for h in self.helpers)
+        if self.installed:
+            e["DISTCC_MIRROR_INSTALLED"] = self.installed
+        if self.rsh:
+            e["DISTCC_MIRROR_RSH"] = self.rsh
+        e.update(self.extra_env)
+        return e
+
+    def full_env(self):
+        e = dict(os.environ)
+        e.update(self.env())
+        return e
+
+
+def all_config_paths():
+    return sorted(glob.glob(os.path.join(CONFIG_DIR, "*.conf")))
+
+
+def config_path_for(name):
+    if os.sep in name or name.endswith(".conf"):
+        return os.path.abspath(os.path.expanduser(name))
+    return os.path.join(CONFIG_DIR, name + ".conf")
+
+
+def load_config(args, required=True):
+    """The config named by -c, $DISTCC_MIRROR_CONFIG, the only one there is,
+    or the one whose roots contain the current directory."""
+    name = getattr(args, "config", None) or os.environ.get(
+        "DISTCC_MIRROR_CONFIG")
+    if name:
+        path = config_path_for(name)
+        if not os.path.exists(path):
+            die("no config %s" % tilde(path))
+        return Config(path)
+    paths = all_config_paths()
+    if not paths:
+        if not required:
+            return None
+        die("no config in %s; create one with: distcc-mirror init"
+            % tilde(CONFIG_DIR))
+    if len(paths) == 1:
+        return Config(paths[0])
+    here = [os.getcwd(), os.environ.get("PWD", "")]
+    matches = []
+    for p in paths:
+        cfg = Config(p)
+        dirs = cfg.roots + ([cfg.build_dir, os.path.realpath(cfg.build_dir)]
+                            if cfg.build_dir else [])
+        if any(h and under(h, d) for h in here for d in dirs):
+            matches.append(cfg)
+    if len(matches) == 1:
+        return matches[0]
+    if not required:
+        return None
+    die("several configs (%s); pick one with -c NAME or run from inside a "
+        "project" % ", ".join(os.path.basename(p)[:-5] for p in paths))
+
+
+# ---------------------------------------------------------------- ssh
+
+def ssh_base(rsh=""):
+    return (shlex.split(rsh) if rsh else ["ssh"]) + [
+        "-o", "BatchMode=yes", "-o", "ConnectTimeout=10"]
+
+
+def ssh_hostname(name):
+    """The address ssh connects to for @p name (ssh_config aliases)."""
+    try:
+        out = subprocess.run(["ssh", "-G", name], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return name
+    for line in out.splitlines():
+        if line.startswith("hostname "):
+            return line.split(None, 1)[1].strip()
+    return name
+
+
+def remote(cfg_or_rsh, host, script, args=(), capture=True):
+    """Run a bash script on @p host with @p args; returns CompletedProcess."""
+    rsh = cfg_or_rsh.rsh if isinstance(cfg_or_rsh, Config) else cfg_or_rsh
+    cmd = ssh_base(rsh) + [host, "bash -s -- "
+                           + " ".join(shlex.quote(a) for a in args)]
+    return subprocess.run(cmd, input=script, text=True,
+                          capture_output=capture)
+
+
+def local_script(script, args=()):
+    return subprocess.run(["bash", "-s", "--"] + list(args), input=script,
+                          text=True, capture_output=True)
+
+
+def port_open(addr, port, timeout=2.0):
+    try:
+        with socket.create_connection((addr, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def label(port):
+    return "%s.%d" % (LABEL_BASE, port)
+
+
+# ---------------------------------------------------------------- facts
+
+# Prints what doctor and brew-parity compare, as key=value lines.  The same
+# script runs here and on each helper.  Arguments: PREFIX PORT LABEL DIR...
+FACTS_SH = r'''
+P="$1"; PORT="$2"; LABEL="$3"; shift 3
+case "$P" in /*) ;; *) P="$HOME/$P";; esac
+echo "home=$HOME"
+echo "os=$(sw_vers -productVersion 2>/dev/null || uname -sr)"
+echo "arch=$(uname -m)"
+echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null)"
+for b in distcc distccd; do
+  if [ -x "$P/bin/$b" ]; then
+    echo "$b=$(shasum -a 256 "$P/bin/$b" | cut -d' ' -f1)"
+  else
+    echo "$b=missing"
+  fi
+done
+echo "whitelist=$(ls "$P/lib/distcc" 2>/dev/null | tr '\n' ' ')"
+dev=$(xcode-select -p 2>/dev/null)
+echo "devdir=$dev"
+if [ -n "$dev" ] && [ -x "$dev/usr/bin/clang" ]; then
+  echo "clang=$(shasum -a 256 "$dev/usr/bin/clang" | cut -d' ' -f1)"
+  echo "clang_version=$("$dev/usr/bin/clang" --version 2>/dev/null | head -1)"
+fi
+echo "clt=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables 2>/dev/null | awk '/^version:/{print $2}')"
+echo "sdk=$(xcrun --show-sdk-version 2>/dev/null)"
+for d in "$@"; do
+  if [ -d "$d" ]; then echo "dir_ok=$d"; else echo "dir_missing=$d"; fi
+done
+if command -v launchctl >/dev/null 2>&1; then
+  st=$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk '$1=="state"{print $3; exit}')
+  echo "agent=${st:-none}"
+fi
+ps -axo pid=,command= 2>/dev/null | grep '[d]istccd' | grep -- "--port $PORT" \
+  | head -1 | sed 's/^ */daemon=/'
+B=/opt/homebrew
+if [ -d "$B/opt" ]; then
+  for o in "$B"/opt/*; do
+    t=$(readlink "$o") || continue
+    case "$t" in *Cellar/*) echo "keg=${t#*Cellar/}";; esac
+  done | sort -u
+  for k in "$B"/Cellar/*/*; do
+    [ -d "$k" ] && echo "cellar=${k#"$B"/Cellar/}"
+  done
+  for l in "$B"/var/homebrew/linked/* "$B"/var/homebrew/pinned/*; do
+    [ -e "$l" ] || [ -L "$l" ] || continue
+    case "$l" in */linked/*) echo "linked=${l##*/}";; *) echo "pinned=${l##*/}";; esac
+  done
+  echo "include=$(ls "$B/include" 2>/dev/null | tr '\n' ' ')"
+fi
+'''
+
+
+class Facts:
+    def __init__(self, text):
+        self.lists = {}
+        for line in text.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                self.lists.setdefault(k, []).append(v)
+
+    def get(self, key, default=""):
+        v = self.lists.get(key)
+        return v[0] if v else default
+
+    def all(self, key):
+        return self.lists.get(key, [])
+
+    def cellar(self):
+        """{"name/version"} of every keg in the Cellar, active or not."""
+        return set(self.all("cellar"))
+
+    def kegs(self):
+        """{name: version} of the kegs the opt links point to."""
+        out = {}
+        for k in self.all("keg"):
+            name, _, ver = k.partition("/")
+            if ver:
+                out[name] = ver.split("/")[0]
+        return out
+
+
+def facts_args(cfg, dirs):
+    return [home_relative(cfg.prefix), str(cfg.port), label(cfg.port)] \
+        + list(dirs)
+
+
+def local_facts(cfg, dirs=()):
+    return Facts(local_script(FACTS_SH, facts_args(cfg, dirs)).stdout)
+
+
+def helper_facts(cfg, helper, dirs=()):
+    r = remote(cfg, helper.ssh, FACTS_SH, facts_args(cfg, dirs))
+    if r.returncode != 0 and "home=" not in r.stdout:
+        return None, (r.stderr.strip() or "ssh failed")
+    return Facts(r.stdout), None
+
+
+# ---------------------------------------------------------------- install
+
+def source_dir(args):
+    if args.source:
+        d = os.path.abspath(args.source)
+    else:
+        d = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if not os.path.exists(os.path.join(d, "src", "distcc.c")):
+        die("not a distcc source tree: %s (give --source DIR)" % d)
+    return d
+
+
+def make_whitelist(prefix):
+    wl = os.path.join(prefix, "lib", "distcc")
+    os.makedirs(wl, exist_ok=True)
+    for c in WHITELIST:
+        p = os.path.join(wl, c)
+        if os.path.islink(p) or os.path.exists(p):
+            os.remove(p)
+        os.symlink("../../bin/distcc", p)
+
+
+def copy_prefix_to(prefix, ssh, rsh=""):
+    rel = home_relative(prefix)
+    r = subprocess.run(ssh_base(rsh) + [ssh, "mkdir -p " + shlex.quote(rel)])
+    if r.returncode != 0:
+        return False
+    cmd = ["rsync", "-a"]
+    if rsh:
+        cmd += ["-e", rsh]
+    cmd += [prefix + "/", "%s:%s/" % (ssh, rel)]
+    info(_c("2", "$ " + " ".join(shlex.quote(c) for c in cmd)))
+    return subprocess.run(cmd).returncode == 0
+
+
+def cmd_install(args):
+    src = source_dir(args)
+    cfg = load_config(args, required=False)
+    prefix = os.path.abspath(os.path.expanduser(
+        args.prefix or (cfg.prefix if cfg else DEFAULT_PREFIX)))
+    if args.helper:
+        helpers = args.helper
+    elif cfg and not args.local_only:
+        helpers = [h.ssh for h in cfg.helpers]
+    else:
+        helpers = []
+    rsh = cfg.rsh if cfg else ""
+
+    if not args.no_build:
+        step("Building distcc in %s" % tilde(src))
+        if not os.path.exists(os.path.join(src, "configure")):
+            run(["./autogen.sh"], cwd=src)
+        current = ""
+        mk = os.path.join(src, "Makefile")
+        if os.path.exists(mk):
+            with open(mk) as f:
+                for line in f:
+                    if line.startswith("prefix = "):
+                        current = line.split("=", 1)[1].strip()
+                        break
+        if current != prefix:
+            conf = ["./configure", "--prefix=" + prefix]
+            if not args.pump:
+                conf.append("--disable-pump-mode")
+            run(conf, cwd=src)
+        make = ["make", "-j%d" % ncpu()]
+        if platform.system() == "Darwin" and shutil.which("brew"):
+            popt = subprocess.run(["brew", "--prefix", "popt"],
+                                  capture_output=True, text=True).stdout.strip()
+            static = os.path.join(popt, "lib", "libpopt.a")
+            if popt and os.path.exists(static):
+                # Static popt: the binaries then run on a helper without
+                # Homebrew's popt.
+                make.append("LIBS=%s -liconv" % static)
+        run(make, cwd=src)
+        run(["make", "install"], cwd=src, stdout=subprocess.DEVNULL)
+
+    step("Installing into %s" % tilde(prefix))
+    if not os.path.exists(os.path.join(prefix, "bin", "distccd")):
+        die("%s/bin/distccd is missing; run without --no-build" % prefix)
+    make_whitelist(prefix)
+    me = os.path.realpath(__file__)
+    dest = os.path.join(prefix, "bin", "distcc-mirror")
+    if os.path.realpath(dest) != me:
+        shutil.copy2(me, dest)
+    info("  distcc, distccd, distcc-mirror and the compiler whitelist "
+         "(%s)" % ", ".join(WHITELIST))
+
+    for h in helpers:
+        step("Copying to %s" % h)
+        if not copy_prefix_to(prefix, h, rsh):
+            die("copy to %s failed" % h)
+        if cfg:
+            lab = label(cfg.port)
+            r = remote(cfg, h, 'launchctl print "gui/$(id -u)/%s" >/dev/null '
+                       '2>&1 && launchctl kickstart -k "gui/$(id -u)/%s" '
+                       '&& echo restarted' % (lab, lab))
+            if "restarted" in r.stdout:
+                info("  restarted the helper daemon on %s" % h)
+            else:
+                info("  no LaunchAgent on %s yet: distcc-mirror helper "
+                     "install" % h)
+
+    path_dirs = os.environ.get("PATH", "").split(":")
+    info("")
+    info("Done.  Add %s to PATH:" % tilde(os.path.join(prefix, "bin")))
+    if os.path.join(prefix, "bin") not in path_dirs:
+        info('  echo \'export PATH="%s:$PATH"\' >> ~/.zshrc'
+             % os.path.join(prefix, "bin").replace(HOME, "$HOME"))
+    if not cfg:
+        info("Next: distcc-mirror init --helper HOST --build BUILD_DIR")
+
+
+# ---------------------------------------------------------------- init
+
+def git_toplevel(d):
+    r = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def cmake_launcher(build_dir):
+    cache = os.path.join(build_dir, "CMakeCache.txt")
+    if not os.path.exists(cache):
+        return None
+    with open(cache, errors="replace") as f:
+        for line in f:
+            if line.startswith("CMAKE_CXX_COMPILER_LAUNCHER:"):
+                return line.split("=", 1)[1].strip()
+    return ""
+
+
+def cmd_init(args):
+    cwd = os.environ.get("PWD") or os.getcwd()
+    if os.path.realpath(cwd) != os.path.realpath(os.getcwd()):
+        cwd = os.getcwd()
+    root = os.path.abspath(os.path.expanduser(args.root)) if args.root \
+        else (git_toplevel(cwd) or cwd)
+    if args.build:
+        # Kept as written (not resolved): the helpers have the tree at the
+        # logical path.
+        b = os.path.expanduser(args.build)
+        if os.path.isabs(b):
+            build = os.path.normpath(b)
+        elif os.path.exists(b):
+            build = os.path.normpath(os.path.join(cwd, b))
+        else:
+            build = os.path.normpath(os.path.join(root, b))
+    elif os.path.exists(os.path.join(cwd, "build.ninja")):
+        build = cwd
+    else:
+        cands = [d for d in sorted(glob.glob(os.path.join(root, "*")))
+                 if os.path.exists(os.path.join(d, "build.ninja"))]
+        if len(cands) != 1:
+            die("cannot tell which build directory to use (%s); give "
+                "--build DIR" % (", ".join(os.path.basename(c) for c in cands)
+                                 or "none found"))
+        build = cands[0]
+    if not os.path.isdir(build):
+        die("build directory %s does not exist" % build)
+    if not under(build, root):
+        die("the build directory %s is not under the root %s"
+            % (tilde(build), tilde(root)))
+    name = args.name or os.path.basename(root).lower()
+    path = config_path_for(name)
+    if os.path.exists(path) and not args.force:
+        die("%s exists (use --force to replace it)" % tilde(path))
+    if not args.helper:
+        die("give at least one --helper SSH_NAME")
+    port = args.port or DEFAULT_PORT
+
+    step("Looking at the helpers")
+    helpers, client_addr = [], args.client_addr or ""
+    for spec in args.helper:
+        m = re.match(r"^([^=/\s]+)(?:=([^/\s]+))?(?:/(\d+))?$", spec)
+        if not m:
+            die("bad --helper %r: expected ssh-name[=address][/slots]" % spec)
+        ssh, addr, jobs = m.groups()
+        addr = addr or ssh_hostname(ssh)
+        if not jobs or not client_addr:
+            r = remote("", ssh, 'echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null '
+                       '|| nproc)"; echo "client=${SSH_CONNECTION%% *}"')
+            if r.returncode != 0:
+                die("cannot ssh to %s: %s" % (ssh, r.stderr.strip()))
+            f = Facts(r.stdout)
+            jobs = jobs or str(int(f.get("ncpu", "6")) + 2)
+            client_addr = client_addr or f.get("client")
+        helpers.append("%s=%s/%s" % (ssh, addr, jobs))
+        info("  %s: address %s, %s slots" % (ssh, addr, jobs))
+    info("  this machine, as the helpers see it: %s" % client_addr)
+
+    excludes = [".git"]
+    for d in sorted(glob.glob(os.path.join(root, "*"))):
+        if (os.path.isdir(d) and not under(build, d)
+                and os.path.exists(os.path.join(d, "CMakeCache.txt"))):
+            excludes.append(os.path.basename(d))      # other build trees
+    excludes += [e for x in (args.exclude or []) for e in split_colon(x)]
+    extra = [os.path.abspath(os.path.expanduser(e))
+             for x in (args.extra or []) for e in split_colon(x)]
+    local_jobs = args.local_jobs or ncpu() + 2
+    prefix = os.path.abspath(os.path.expanduser(args.prefix or DEFAULT_PREFIX))
+
+    env = {}
+    for kv in args.set or []:
+        if "=" not in kv:
+            die("--set wants KEY=VALUE, not %r" % kv)
+        k, v = kv.split("=", 1)
+        env[k] = v
+    launcher = cmake_launcher(build)
+    notes = []
+    if launcher and "ccache" in launcher and "CCACHE_PREFIX" not in env:
+        env["CCACHE_PREFIX"] = os.path.join(prefix, "bin", "distcc")
+    elif launcher == "":
+        notes.append("The build has no compiler launcher.  Reconfigure it "
+                     "with\n    cmake -DCMAKE_C_COMPILER_LAUNCHER=distcc "
+                     "-DCMAKE_CXX_COMPILER_LAUNCHER=distcc %s" % tilde(build))
+
+    lines = [
+        "# distcc-mirror config for %s (written by distcc-mirror init on %s)."
+        % (name, time.strftime("%Y-%m-%d")),
+        "# KEY=VALUE lines; ~ and $VARS are expanded.  Keys not listed here",
+        "# are exported to the build as they are.",
+        "",
+        "# Source trees, copied to the helpers and compiled in place there",
+        "# (colon-separated; same paths on every machine).",
+        "ROOTS=%s" % tilde(root),
+        "# Where ninja runs.  Only sources, headers and PCHs in it are synced.",
+        "BUILD_DIR=%s" % tilde(build),
+        "# Names at the top of each root that are neither copied nor compared.",
+        "EXCLUDE=%s" % ":".join(excludes),
+        "# More trees to copy whole, e.g. dependencies built locally.",
+        "EXTRA=%s" % ":".join(tilde(e) for e in extra),
+        "# Helpers: ssh-name=address/slots, space-separated.",
+        "HELPERS=\"%s\"" % " ".join(helpers),
+        "# Compile slots on this machine.",
+        "LOCAL_JOBS=%d" % local_jobs,
+        "# Port of the mirror daemon on the helpers.",
+        "PORT=%d" % port,
+        "# This machine's address as the helpers see it (their --allow).",
+        "CLIENT_ADDR=%s" % client_addr,
+        "# Where distcc is installed, on every machine.",
+        "PREFIX=%s" % tilde(prefix),
+    ]
+    if env:
+        lines += ["", "# Exported to the build:"]
+        lines += ["%s=%s" % (k, tilde(v) if re.match(r"^[\w@%+=:,./~-]*$",
+                                                   tilde(v))
+                             else shlex.quote(v)) for k, v in env.items()]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+    step("Wrote %s" % tilde(path))
+    info("\n".join("  " + l for l in lines if l and not l.startswith("#")))
+    for n in notes:
+        info("\nNote: " + n)
+    info("\nNext:\n  distcc-mirror helper install    # start the daemon on "
+         "the helpers\n  distcc-mirror doctor\n  distcc-mirror build")
+
+
+# ---------------------------------------------------------------- show/env
+
+def cmd_show(args):
+    cfg = load_config(args)
+    info("config      %s" % tilde(cfg.path))
+    info("roots       %s" % " ".join(tilde(r) for r in cfg.roots))
+    info("build dir   %s" % tilde(cfg.build_dir or "(none)"))
+    if cfg.build_dir and os.path.realpath(cfg.build_dir) != cfg.build_dir:
+        info("            really %s" % tilde(os.path.realpath(cfg.build_dir)))
+    for h in cfg.helpers:
+        info("helper      %s (%s:%d, %d slots)" % (h.ssh, h.addr, h.port,
+                                                   h.jobs))
+    info("local       %d slots; ninja -j%d" % (cfg.local_jobs,
+                                               cfg.total_jobs()))
+    info("prefix      %s" % tilde(cfg.prefix))
+    info("\nenvironment:")
+    for k, v in cfg.env().items():
+        if k != "PATH":
+            info("  %s=%s" % (k, v))
+    info("  PATH=%s:..." % cfg.bindir())
+
+
+def cmd_env(args):
+    cfg = load_config(args)
+    for k, v in cfg.env().items():
+        if k == "PATH":
+            print('export PATH=%s:"$PATH"' % shlex.quote(cfg.bindir()))
+        else:
+            print("export %s=%s" % (k, shlex.quote(v)))
+
+
+def cmd_run(args):
+    cfg = load_config(args)
+    cmd = args.command
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        die("usage: distcc-mirror run COMMAND [ARGS...]")
+    env = cfg.full_env()
+    os.execvpe(cmd[0], cmd, env)
+
+
+def cmd_shell(args):
+    cfg = load_config(args)
+    env = cfg.full_env()
+    env["DISTCC_MIRROR_CONFIG"] = cfg.path
+    sh = os.environ.get("SHELL", "/bin/sh")
+    info("distcc-mirror: %s environment (exit to leave); ninja -j%d"
+         % (cfg.name, cfg.total_jobs()))
+    os.execvpe(sh, [sh], env)
+
+
+# ---------------------------------------------------------------- sync/build
+
+def do_sync(cfg, hosts=()):
+    if not os.path.exists(cfg.distcc()):
+        die("%s is missing; run distcc-mirror install" % cfg.distcc())
+    r = subprocess.run([cfg.distcc(), "--mirror-sync"] + list(hosts),
+                       env=cfg.full_env())
+    if r.returncode != 0:
+        die("sync failed", r.returncode)
+
+
+def cmd_sync(args):
+    cfg = load_config(args)
+    step("Syncing to %s" % (" ".join(args.host)
+                            or " ".join(h.ssh for h in cfg.helpers)))
+    do_sync(cfg, args.host)
+
+
+def pch_targets(build_dir, env):
+    r = subprocess.run(["ninja", "-C", build_dir, "-t", "targets", "all"],
+                       capture_output=True, text=True, env=env)
+    out = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"^(.*\.(?:pch|gch)): ", line)
+        if m:
+            out.append(m.group(1))
+    return out
+
+
+def cmd_build(args):
+    cfg = load_config(args)
+    build = os.path.abspath(args.build_dir or cfg.build_dir or ".")
+    env = cfg.full_env()
+    rest = list(args.ninja_args)
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+    ninja = os.path.exists(os.path.join(build, "build.ninja"))
+    if not ninja and not os.path.exists(os.path.join(build, "Makefile")):
+        die("no build.ninja or Makefile in %s" % build)
+    t0 = time.time()
+    if ninja and not args.no_pch:
+        pchs = pch_targets(build, env)
+        if pchs:
+            # The helpers compile against copies of the PCHs, so they are
+            # built (locally) and synced before anything else.
+            step("Building %d precompiled headers" % len(pchs))
+            run(["ninja", "-C", build] + pchs, env=env)
+    if not args.no_sync:
+        step("Syncing to %s" % " ".join(h.ssh for h in cfg.helpers))
+        do_sync(cfg)
+    t1 = time.time()
+    has_j = any(a.startswith("-j") for a in rest)
+    jobs = [] if has_j else ["-j%d" % cfg.total_jobs()]
+    tool = ["ninja", "-C", build] if ninja else ["make", "-C", build]
+    step("Building (%s)" % (" ".join(jobs + rest) or "all"))
+    r = subprocess.run(tool + jobs + rest, env=env)
+    t2 = time.time()
+    info("\ndistcc-mirror: preparation %.1fs, build %.1fs, total %.1fs"
+         % (t1 - t0, t2 - t1, t2 - t0))
+    sys.exit(r.returncode)
+
+
+# ---------------------------------------------------------------- test
+
+LAUNCHERS = ("ccache", "sccache", "distcc")
+
+
+def compile_entries(build_dir):
+    p = os.path.join(build_dir, "compile_commands.json")
+    if not os.path.exists(p):
+        die("no compile_commands.json in %s (configure with "
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON)" % tilde(build_dir))
+    with open(p) as f:
+        db = json.load(f)
+    out = []
+    for e in db:
+        argv = e.get("arguments") or shlex.split(e["command"])
+        while argv and os.path.basename(argv[0]) in LAUNCHERS:
+            argv = argv[1:]
+        joined = " ".join(argv)
+        if "-emit-pch" in joined or re.search(r"-x\s*\S*-header", joined):
+            continue
+        out.append((e["directory"], e["file"], argv))
+    return out
+
+
+def retarget(argv, obj, dep):
+    """argv with the object and dependency file moved to @p obj, @p dep."""
+    out, i = [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-o", "-MF") and i + 1 < len(argv):
+            out += [a, obj if a == "-o" else dep]
+            i += 2
+            continue
+        if a.startswith("-o") and len(a) > 2:
+            out.append("-o" + obj)
+        elif a.startswith("-MF") and len(a) > 3:
+            out.append("-MF" + dep)
+        elif a in ("--serialize-diagnostics", "-MJ") and i + 1 < len(argv):
+            i += 2
+            continue
+        else:
+            out.append(a)
+        i += 1
+    return out
+
+
+def classify(log):
+    """What happened to a mirrored job, from distcc's verbose log."""
+    reasons = [l.split("mirror: ", 1)[1] for l in log.splitlines()
+               if "mirror: " in l and "mirror: checked " not in l]
+    m = re.search(r"mirror: MIRR (\d+): (.*)", log)
+    if "compiled in the mirror on" in log:
+        return "mirrored", ""
+    if m:
+        return "refused (MIRR %s)" % m.group(1), m.group(2)
+    if "differs from the helper's copy" in log:
+        r = re.search(r"mirror: (.*) differs from the helper's copy", log)
+        return "rejected", "%s differs" % (r.group(1) if r else "a file")
+    if re.search(r"compile of .* failed on", log):
+        return "failed in mirror", ""
+    if "outside DISTCC_MIRROR_ROOTS" in log:
+        return "not mirrored", "cwd outside ROOTS"
+    if "still in backoff period" in log:
+        return "not mirrored", ("the helper is in backoff after a failed "
+                                "job; it is retried after a minute")
+    return "not mirrored", reasons[-1] if reasons else ""
+
+
+def cmd_test(args):
+    cfg = load_config(args)
+    build = os.path.abspath(args.build_dir or cfg.build_dir or ".")
+    entries = compile_entries(build)
+    if args.match:
+        entries = [e for e in entries if any(m in e[1] for m in args.match)]
+    if not entries:
+        die("no matching compile commands")
+    rnd = random.Random(args.seed)
+    pick = entries if len(entries) <= args.count else rnd.sample(
+        entries, args.count)
+    helpers = [h for h in cfg.helpers
+               if not args.helper or h.ssh in args.helper]
+    if not helpers:
+        die("no such helper")
+    h = helpers[0]
+    if not port_open(h.addr, h.port):
+        die("%s:%d does not answer; start it with: distcc-mirror helper "
+            "install" % (h.addr, h.port))
+    env = cfg.full_env()
+    env.pop("DISTCC_LOG", None)
+    env["DISTCC_HOSTS"] = "%s:%d/4,mirror" % (h.addr, h.port)
+    env["DISTCC_VERBOSE"] = "1"
+    step("Compiling %d file(s) on %s through the mirror%s"
+         % (len(pick), h.ssh, "" if args.no_compare
+            else ", and locally to compare"))
+    tmp = tempfile.mkdtemp(prefix="distcc-mirror-test.")
+    counts = {}
+    different = 0
+    try:
+        for directory, src, argv in pick:
+            obj = os.path.join(tmp, "out.o")
+            dep = os.path.join(tmp, "out.d")
+            cmd = retarget(argv, obj, dep)
+            t0 = time.time()
+            r = subprocess.run([cfg.distcc()] + cmd, cwd=directory, env=env,
+                               capture_output=True, text=True)
+            secs = time.time() - t0
+            what, why = classify(r.stderr)
+            if r.returncode != 0:
+                what, why = "compile error", r.stderr.strip().splitlines()[-1]
+            same = ""
+            if not args.no_compare and r.returncode == 0:
+                os.rename(obj, obj + ".mirror")
+                l = subprocess.run(cmd, cwd=directory, capture_output=True)
+                if l.returncode == 0:
+                    with open(obj, "rb") as a, open(obj + ".mirror", "rb") as b:
+                        if a.read() == b.read():
+                            same = "identical"
+                        else:
+                            same = "OBJECT DIFFERS"
+                            different += 1
+            counts[what] = counts.get(what, 0) + 1
+            color = "32" if what == "mirrored" else "33"
+            rel = src
+            for root in cfg.roots:
+                if under(src, root):
+                    rel = os.path.relpath(src, root)
+            info("  %s %5.1fs  %s%s" % (
+                _c(color, "%-17s" % what), secs, rel,
+                ("  [%s]" % _c("31" if "DIFF" in same else "2", same))
+                if same else ""))
+            if why:
+                info("      " + _c("2", why))
+            for f in (obj, obj + ".mirror", dep):
+                if os.path.exists(f):
+                    os.remove(f)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    info("")
+    info("summary: " + ", ".join("%d %s" % (n, w)
+                                 for w, n in sorted(counts.items())))
+    if counts.get("mirrored", 0) < len(pick):
+        info("Jobs that were not mirrored still built correctly (the "
+             "classic way).  If\nmany are rejected, run distcc-mirror sync, "
+             "then distcc-mirror doctor.")
+    if different:
+        die("%d object(s) differ from a local compile" % different)
+
+
+# ---------------------------------------------------------------- doctor
+
+def cmd_doctor(args):
+    cfg = load_config(args)
+    rep = Report()
+    step("This machine (%s)" % tilde(cfg.path))
+    dirs = cfg.roots + cfg.extra
+    lf = local_facts(cfg, dirs)
+    distcc = cfg.distcc()
+    if lf.get("distcc") == "missing" or lf.get("distccd") == "missing":
+        rep.fail("distcc is not installed in %s" % tilde(cfg.prefix),
+                 "contrib/distcc-mirror install (from the distcc source tree)")
+    else:
+        h = subprocess.run([distcc, "--help"], capture_output=True,
+                           text=True)
+        if "--mirror-sync" not in (h.stdout + h.stderr):
+            rep.fail("%s has no mirror mode" % tilde(distcc),
+                     "contrib/distcc-mirror install")
+        else:
+            rep.ok("distcc with mirror mode in %s" % tilde(cfg.bindir()))
+    for d in lf.all("dir_missing"):
+        rep.fail("%s does not exist" % tilde(d))
+    if cfg.build_dir:
+        b = cfg.build_dir
+        if not os.path.isdir(b):
+            rep.fail("build dir %s does not exist" % tilde(b))
+        else:
+            if not any(under(b, r) for r in cfg.roots):
+                rep.fail("build dir %s is not under ROOTS" % tilde(b))
+            else:
+                rep.ok("build dir %s%s" % (tilde(b), (
+                    " (really %s)" % tilde(os.path.realpath(b)))
+                    if os.path.realpath(b) != b else ""))
+            launcher = cmake_launcher(b)
+            if launcher is None:
+                pass
+            elif launcher == "":
+                rep.warn("the build has no compiler launcher, so it does not "
+                         "use distcc", "cmake -DCMAKE_C_COMPILER_LAUNCHER="
+                         "distcc -DCMAKE_CXX_COMPILER_LAUNCHER=distcc "
+                         + tilde(b))
+            elif "ccache" in launcher:
+                cp = cfg.extra_env.get("CCACHE_PREFIX")
+                if not cp:
+                    rep.warn("the build uses ccache but CCACHE_PREFIX is not "
+                             "set, so nothing is distributed",
+                             "add CCACHE_PREFIX=%s to %s"
+                             % (tilde(distcc), tilde(cfg.path)))
+                else:
+                    rep.ok("ccache hands jobs to %s" % tilde(cp))
+            else:
+                rep.ok("compiler launcher: %s" % launcher)
+    if not shutil.which("rsync"):
+        rep.fail("rsync is not installed")
+
+    for h in cfg.helpers:
+        step("Helper %s (%s:%d)" % (h.ssh, h.addr, h.port))
+        hf, err = helper_facts(cfg, h, dirs)
+        if hf is None:
+            rep.fail("cannot ssh to %s: %s" % (h.ssh, err),
+                     "check that 'ssh %s' works without a password"
+                     % h.ssh)
+            continue
+        rep.ok("ssh works (macOS %s, %s, %s cores)"
+               % (hf.get("os"), hf.get("arch"), hf.get("ncpu")))
+        if hf.get("arch") != lf.get("arch"):
+            rep.fail("architecture %s differs from this machine's %s"
+                     % (hf.get("arch"), lf.get("arch")))
+        if hf.get("distccd") == "missing":
+            rep.fail("distcc is not installed on %s" % h.ssh,
+                     "distcc-mirror install --no-build --helper " + h.ssh)
+        elif hf.get("distccd") != lf.get("distccd"):
+            rep.warn("its distccd differs from this machine's build",
+                     "distcc-mirror install --no-build --helper " + h.ssh)
+        else:
+            rep.ok("same distcc build as here")
+        wl = hf.get("whitelist").split()
+        if not {"clang", "clang++"} <= set(wl):
+            rep.fail("the compiler whitelist (%s/lib/distcc) lacks clang"
+                     % tilde(cfg.prefix),
+                     "distcc-mirror install --no-build --helper " + h.ssh)
+        if not hf.get("clang"):
+            rep.fail("no clang (Command Line Tools) on %s" % h.ssh)
+        elif hf.get("clang") != lf.get("clang"):
+            rep.fail("the compiler differs (here: %s / CLT %s; there: %s / "
+                     "CLT %s): every job would fall back (MIRR 6)"
+                     % (lf.get("clang_version"), lf.get("clt"),
+                        hf.get("clang_version"), hf.get("clt")),
+                     "install the same Command Line Tools on both")
+        else:
+            rep.ok("same compiler (%s)" % hf.get("clang_version"))
+        if hf.get("sdk") != lf.get("sdk"):
+            rep.fail("SDK %s differs from this machine's %s"
+                     % (hf.get("sdk"), lf.get("sdk")))
+        missing = hf.all("dir_missing")
+        for d in missing:
+            fix = "distcc-mirror sync" if d in cfg.roots + cfg.extra else None
+            rep.fail("%s is missing there" % tilde(d), fix)
+        if not missing:
+            rep.ok("roots and extra trees are present (run distcc-mirror "
+                   "sync before building)")
+
+        daemon = hf.get("daemon")
+        agent = hf.get("agent")
+        if not daemon:
+            rep.fail("no daemon on port %d" % h.port,
+                     "distcc-mirror helper install")
+        else:
+            roots_missing = [r for r in cfg.roots
+                             if "--mirror-root %s" % r not in daemon]
+            if roots_missing:
+                rep.fail("the daemon does not serve %s"
+                         % " ".join(tilde(r) for r in roots_missing),
+                         "distcc-mirror helper install")
+            elif agent in ("none", ""):
+                rep.warn("the daemon was started by hand and will not "
+                         "survive a reboot", "distcc-mirror helper install")
+            else:
+                rep.ok("daemon running (LaunchAgent %s)" % label(h.port))
+        if port_open(h.addr, h.port):
+            rep.ok("%s:%d answers" % (h.addr, h.port))
+        elif daemon:
+            rep.fail("%s:%d does not answer from here" % (h.addr, h.port),
+                     "check --listen/--allow (CLIENT_ADDR=%s)"
+                     % cfg.client_addr)
+
+        lk, hk = lf.kegs(), hf.kegs()
+        if lk:
+            hc = hf.cellar()
+            miss = sorted(n for n in lk if n not in hk
+                          and "%s/%s" % (n, lk[n]) not in hc)
+            noopt = sorted(n for n in lk if n not in hk
+                           and "%s/%s" % (n, lk[n]) in hc)
+            diff = sorted(n for n in lk if n in hk and hk[n] != lk[n])
+            if noopt:
+                rep.warn("%d kegs are there but have no /opt/homebrew/opt "
+                         "link (%s)" % (len(noopt), ", ".join(noopt)),
+                         "distcc-mirror brew-parity --apply")
+            inc_l = set(lf.get("include").split())
+            inc_h = set(hf.get("include").split())
+            if miss or diff:
+                rep.warn("Homebrew differs: %d formulae missing there%s, %d "
+                         "at other versions%s" % (
+                             len(miss), (" (%s%s)" % (", ".join(miss[:6]),
+                                          ", ..." if len(miss) > 6 else ""))
+                             if miss else "",
+                             len(diff), (" (%s)" % ", ".join(
+                                 "%s %s/%s" % (n, lk[n], hk[n])
+                                 for n in diff[:4])) if diff else ""),
+                         "distcc-mirror brew-parity  (jobs reading those "
+                         "headers fall back)")
+            else:
+                rep.ok("Homebrew: the same %d formulae at the same versions"
+                       % len(lk))
+            if inc_l != inc_h:
+                only = sorted(inc_l ^ inc_h)
+                rep.warn("/opt/homebrew/include differs: %s%s"
+                         % (", ".join(only[:6]),
+                            ", ..." if len(only) > 6 else ""))
+
+    info("")
+    if rep.problems:
+        die("%d problem(s), %d warning(s)" % (rep.problems, rep.warnings))
+    info(_c("32", "All good") + ("" if not rep.warnings else
+                                 " (%d warning(s))" % rep.warnings))
+
+
+# ---------------------------------------------------------------- helper
+
+def daemon_plan(cfg, h):
+    """The daemon's settings for helper @p h: the union over every config
+    that names the same helper and port."""
+    roots, allows, jobs, extra = [], [], h.jobs, list(cfg.daemon_args)
+    for p in all_config_paths() + [cfg.path]:
+        try:
+            c = cfg if p == cfg.path else Config(p)
+        except SystemExit:
+            continue
+        if c.port != cfg.port or h.ssh not in [x.ssh for x in c.helpers]:
+            continue
+        for r in c.roots:
+            if r not in roots:
+                roots.append(r)
+        if c.client_addr and c.client_addr not in allows:
+            allows.append(c.client_addr)
+        jobs = max(jobs, max(x.jobs for x in c.helpers if x.ssh == h.ssh))
+    if not allows:
+        die("CLIENT_ADDR is not set in %s (this machine's address as the "
+            "helper sees it)" % tilde(cfg.path))
+    return roots, allows, jobs, extra
+
+
+AGENT_SH = r'''
+set -u
+ACTION="$1"; LABEL="$2"; PREFIX="$3"; PORT="$4"; LOG="$HOME/Library/Logs/$5"
+shift 5
+case "$PREFIX" in /*) ;; *) PREFIX="$HOME/$PREFIX";; esac
+uid=$(id -u)
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+loaded() { launchctl print "gui/$uid/$LABEL" >/dev/null 2>&1; }
+unload() {
+  loaded || return 0
+  launchctl bootout "gui/$uid/$LABEL" 2>/dev/null
+  for i in $(seq 50); do loaded || return 0; sleep 0.1; done
+}
+stop_by_hand() {
+  # A daemon started by hand from this prefix on this port.
+  pf="$PREFIX/distccd.pid"
+  [ -f "$pf" ] || return 0
+  pid=$(cat "$pf")
+  if ! kill -0 "$pid" 2>/dev/null; then
+    rm -f "$pf"
+  elif ps -p "$pid" -o command= | grep -q -- "--port $PORT"; then
+    kill "$pid"
+    for i in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    rm -f "$pf"
+    echo "stopped the daemon that was started by hand (pid $pid)"
+  fi
+}
+case "$ACTION" in
+install)
+  [ -x "$PREFIX/bin/distccd" ] || { echo "$PREFIX/bin/distccd is missing: run distcc-mirror install" >&2; exit 3; }
+  mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+  # distccd refuses a --mirror-root that does not exist; the sync fills it.
+  for r in "$@"; do mkdir -p "$r"; done
+  unload
+  stop_by_hand
+  cat > "$PLIST"
+  launchctl bootstrap "gui/$uid" "$PLIST" || exit 4
+  echo "loaded $LABEL"
+  for i in $(seq 50); do
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 && { echo "listening on port $PORT"; exit 0; }
+    sleep 0.2
+  done
+  echo "not listening on port $PORT after 10s; log:" >&2
+  tail -n 15 "$LOG" >&2
+  exit 5;;
+start)
+  [ -f "$PLIST" ] || { echo "not installed: distcc-mirror helper install" >&2; exit 3; }
+  if loaded; then launchctl kickstart "gui/$uid/$LABEL"; else launchctl bootstrap "gui/$uid" "$PLIST"; fi && echo "started";;
+stop) unload; echo "stopped";;
+restart) launchctl kickstart -k "gui/$uid/$LABEL" && echo "restarted";;
+uninstall) unload; rm -f "$PLIST"; echo "removed $LABEL";;
+status)
+  launchctl print "gui/$uid/$LABEL" 2>/dev/null \
+    | awk '/^\t(state|pid|runs|last exit code) = /{sub(/^\t/, ""); print "  agent " $0}'
+  loaded || echo "  agent: not installed"
+  ps -axo pid=,etime=,command= | grep '[d]istccd' | grep -- "--port $PORT" | head -1 | awk '{print "  daemon pid " $1 ", up " $2}'
+  n=$(ps -axo command= | grep '[d]istccd' | grep -c -- "--port $PORT")
+  echo "  processes: $n"
+  [ -f "$LOG" ] && { echo "  last log lines:"; tail -n 5 "$LOG" | sed 's/^/    /'; };;
+log) tail -n "${1:-50}" "$LOG";;
+esac
+'''
+
+
+def log_name(port):
+    if port == DEFAULT_PORT:
+        return "distccd-mirror.log"
+    return "distccd-mirror-%d.log" % port
+
+
+def agent_action(cfg, h, action, stdin_extra="", extra=()):
+    args = [action, label(cfg.port), home_relative(cfg.prefix),
+            str(cfg.port), log_name(cfg.port)] + list(extra)
+    if stdin_extra:
+        # The script goes on the command line so that stdin can carry the
+        # plist, for "cat > $PLIST".
+        cmd = ssh_base(cfg.rsh) + [h.ssh, "bash -c " + shlex.quote(
+            AGENT_SH) + " -- " + " ".join(shlex.quote(a) for a in args)]
+        return subprocess.run(cmd, input=stdin_extra, text=True,
+                              capture_output=True)
+    return remote(cfg, h.ssh, AGENT_SH, args)
+
+
+def helper_install(cfg, h):
+    r = remote(cfg, h.ssh, 'printf %s "$HOME"')
+    if r.returncode != 0:
+        die("cannot ssh to %s: %s" % (h.ssh, r.stderr.strip()))
+    rhome = r.stdout.strip()
+    rel = home_relative(cfg.prefix)
+    rprefix = rel if rel.startswith("/") else rhome + "/" + rel
+    roots, allows, jobs, extra = daemon_plan(cfg, h)
+    argv = [rprefix + "/bin/distccd", "--daemon", "--no-detach",
+            "--listen", h.addr, "--port", str(h.port), "--jobs", str(jobs),
+            "--log-file", rhome + "/Library/Logs/" + log_name(h.port)]
+    for a in allows:
+        argv += ["--allow", a if "/" in a else a + "/32"]
+    for root in roots:
+        argv += ["--mirror-root", root]
+    argv += extra
+    plist = plistlib.dumps({
+        "Label": label(h.port),
+        "ProgramArguments": argv,
+        # Errors before the log file is open (a bad option, a missing
+        # root, a failed confinement probe) go to stderr.
+        "StandardErrorPath": rhome + "/Library/Logs/" + log_name(h.port),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "ProcessType": "Standard",
+    }).decode()
+    step("Installing the daemon on %s (LaunchAgent %s)"
+         % (h.ssh, label(h.port)))
+    info("  " + _c("2", " ".join(shlex.quote(a) for a in argv)))
+    r = agent_action(cfg, h, "install", stdin_extra=plist, extra=roots)
+    for line in (r.stdout + r.stderr).strip().splitlines():
+        info("  " + line)
+    if r.returncode != 0:
+        die("installing on %s failed" % h.ssh)
+    if port_open(h.addr, h.port, 3):
+        info("  " + _c("32", "%s:%d answers from here" % (h.addr, h.port)))
+    else:
+        die("the daemon listens, but %s:%d does not answer from here "
+            "(firewall, or the wrong --listen address?)" % (h.addr, h.port))
+
+
+def cmd_helper(args):
+    cfg = load_config(args)
+    helpers = [h for h in cfg.helpers if not args.host or h.ssh in args.host]
+    if not helpers:
+        die("no such helper in %s" % tilde(cfg.path))
+    for h in helpers:
+        if args.action == "install":
+            helper_install(cfg, h)
+            continue
+        if len(helpers) > 1 or args.action == "status":
+            step("%s (%s:%d)" % (h.ssh, h.addr, h.port))
+        extra = [str(args.lines)] if args.action == "log" else []
+        r = agent_action(cfg, h, args.action, extra=extra)
+        out = (r.stdout + r.stderr).rstrip()
+        if out:
+            info(out)
+        if args.action == "status":
+            ok = port_open(h.addr, h.port)
+            info("  %s:%d from here: %s" % (
+                h.addr, h.port, _c("32", "answers") if ok
+                else _c("31", "no answer")))
+
+
+# ---------------------------------------------------------------- brew
+
+BREW_APPLY_SH = r'''
+export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ENV_HINTS=1
+B=/opt/homebrew; brew=$B/bin/brew; rc=0
+# Arguments: name version link(1/0) ...
+while [ $# -ge 3 ]; do
+  n=$1; v=$2; l=$3; shift 3
+  [ -e "$B/var/homebrew/pinned/$n" ] && $brew unpin "$n" >/dev/null 2>&1
+  [ -e "$B/var/homebrew/linked/$n" ] && $brew unlink "$n" >/dev/null 2>&1
+  ln -sfn "../Cellar/$n/$v" "$B/opt/$n"
+  if [ "$l" = 1 ]; then
+    if out=$($brew link "$n" 2>&1); then echo "linked $n $v"; else echo "LINK FAILED $n: $out" | tail -2; rc=1; fi
+  else
+    echo "opt link for $n $v (not linked, as here)"
+  fi
+  $brew pin "$n" >/dev/null 2>&1 || true
+done
+exit $rc
+'''
+
+
+def cmd_brew_parity(args):
+    cfg = load_config(args)
+    if not os.path.isdir(BREW + "/Cellar"):
+        die("no Homebrew in %s" % BREW)
+    lf = local_facts(cfg)
+    lk = lf.kegs()
+    linked = set(lf.all("linked"))
+    helpers = [h for h in cfg.helpers if not args.host or h.ssh in args.host]
+    for h in helpers:
+        step("Homebrew on %s compared with here" % h.ssh)
+        hf, err = helper_facts(cfg, h)
+        if hf is None:
+            die("cannot ssh to %s: %s" % (h.ssh, err))
+        hk = hf.kegs()
+        hc = hf.cellar()
+        miss = sorted(n for n in lk if n not in hk)
+        diff = sorted(n for n in lk if n in hk and hk[n] != lk[n])
+        extra = sorted(n for n in hk if n not in lk)
+        # In the helper's Cellar already, only not active (no opt link).
+        present = {n for n in miss + diff if "%s/%s" % (n, lk[n]) in hc}
+        if args.only:
+            only = {x for o in args.only for x in o.split(",")}
+            miss = [n for n in miss if n in only]
+            diff = [n for n in diff if n in only]
+        info("  same:      %d" % (len(lk) - len(miss) - len(diff)))
+        info("  missing:   %d%s" % (len(miss), (
+            "  " + " ".join("%s %s%s" % (n, lk[n], " (no opt link)"
+                                         if n in present else "")
+                            for n in miss))
+            if miss else ""))
+        info("  different: %d%s" % (len(diff), (
+            "  " + " ".join("%s %s (there %s)" % (n, lk[n], hk[n])
+                            for n in diff)) if diff else ""))
+        if extra:
+            info("  only there: %d (left alone)" % len(extra))
+        inc_l = set(lf.get("include").split())
+        inc_h = set(hf.get("include").split())
+        if inc_l != inc_h:
+            info("  /opt/homebrew/include: only here: %s; only there: %s"
+                 % (" ".join(sorted(inc_l - inc_h)) or "-",
+                    " ".join(sorted(inc_h - inc_l)) or "-"))
+        todo = miss + (diff if args.different else [])
+        if not args.apply:
+            if miss or diff:
+                info("\nTo copy the missing kegs at this machine's versions "
+                     "(then link and pin them):\n  distcc-mirror brew-parity "
+                     "--apply%s" % ("" if not diff else
+                                    "\nTo also replace the %d at other "
+                                    "versions: add --different" % len(diff)))
+            continue
+        if not todo:
+            info("  nothing to copy")
+            continue
+        copy = [n for n in todo if n not in present]
+        if copy:
+            step("Copying %d keg(s) to %s" % (len(copy), h.ssh))
+            mk = " ".join(shlex.quote("%s/Cellar/%s" % (BREW, n))
+                          for n in copy)
+            if remote(cfg, h.ssh, "mkdir -p " + mk,
+                      capture=False).returncode:
+                die("mkdir on %s failed" % h.ssh)
+        for n in copy:
+            src = "%s/Cellar/%s/%s" % (BREW, n, lk[n])
+            cmd = ["rsync", "-a"] + (["-e", cfg.rsh] if cfg.rsh else []) + [
+                src, "%s:%s/Cellar/%s/" % (h.ssh, BREW, n)]
+            if subprocess.run(cmd).returncode != 0:
+                die("copying %s failed" % n)
+            info("  copied %s %s" % (n, lk[n]))
+        step("Linking and pinning on %s" % h.ssh)
+        argv = []
+        for n in todo:
+            argv += [n, lk[n], "1" if n in linked else "0"]
+        r = remote(cfg, h.ssh, BREW_APPLY_SH, argv)
+        for line in (r.stdout + r.stderr).strip().splitlines():
+            info("  " + line)
+        if r.returncode != 0:
+            info(_c("33", "  some links failed (see above); a conflicting "
+                    "file in /opt/homebrew usually needs a look by hand"))
+        info("Pinned, so brew upgrade leaves them alone.  Upgrade both "
+             "machines together.")
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(
+        prog="distcc-mirror",
+        description=__doc__.split("\n\n", 1)[0],
+        epilog=__doc__.split("\n\n", 1)[1],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-c", "--config", metavar="NAME",
+                   help="config name or file (default: the one for the "
+                   "current directory)")
+    sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
+
+    s = sub.add_parser("install", help="build and install distcc here and "
+                       "on the helpers")
+    s.add_argument("--prefix", help="install prefix (default %s)"
+                   % tilde(DEFAULT_PREFIX))
+    s.add_argument("--source", help="distcc source tree (default: the one "
+                   "this script is in)")
+    s.add_argument("--helper", action="append", metavar="SSH",
+                   help="also copy to this helper (repeatable; default: the "
+                   "config's helpers)")
+    s.add_argument("--local-only", action="store_true",
+                   help="do not copy to the helpers")
+    s.add_argument("--no-build", action="store_true",
+                   help="only install and copy what is already built")
+    s.add_argument("--pump", action="store_true",
+                   help="also build pump mode (needs Python setuptools)")
+    s.set_defaults(fn=cmd_install)
+
+    s = sub.add_parser("init", help="write a config for a project")
+    s.add_argument("--helper", action="append", metavar="SSH[=ADDR][/SLOTS]",
+                   help="a helper, by its ssh name (repeatable)")
+    s.add_argument("--build", metavar="DIR", help="build directory "
+                   "(default: the one with build.ninja here or in the root)")
+    s.add_argument("--root", metavar="DIR", help="source root (default: the "
+                   "git work tree)")
+    s.add_argument("--name", help="config name (default: the root's name)")
+    s.add_argument("--exclude", action="append", metavar="NAMES",
+                   help="more top-level names not to sync")
+    s.add_argument("--extra", action="append", metavar="DIRS",
+                   help="more trees to sync whole")
+    s.add_argument("--local-jobs", type=int, metavar="N")
+    s.add_argument("--port", type=int)
+    s.add_argument("--client-addr", metavar="ADDR")
+    s.add_argument("--prefix")
+    s.add_argument("--set", action="append", metavar="KEY=VALUE",
+                   help="extra variable to export to the build")
+    s.add_argument("--force", action="store_true")
+    s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("show", help="print the config and environment")
+    s.set_defaults(fn=cmd_show)
+    s = sub.add_parser("env", help="print export lines for eval")
+    s.set_defaults(fn=cmd_env)
+    s = sub.add_parser("run", help="run a command with the environment")
+    s.add_argument("command", nargs=argparse.REMAINDER)
+    s.set_defaults(fn=cmd_run)
+    s = sub.add_parser("shell", help="start a shell with the environment")
+    s.set_defaults(fn=cmd_shell)
+
+    s = sub.add_parser("sync", help="copy the tree to the helpers")
+    s.add_argument("host", nargs="*", help="ssh names (default: all)")
+    s.set_defaults(fn=cmd_sync)
+
+    s = sub.add_parser("build", help="build PCHs, sync, then ninja")
+    s.add_argument("-C", dest="build_dir", metavar="DIR",
+                   help="build directory (default: BUILD_DIR)")
+    s.add_argument("--no-sync", action="store_true")
+    s.add_argument("--no-pch", action="store_true")
+    s.add_argument("ninja_args", nargs=argparse.REMAINDER,
+                   help="passed to ninja (e.g. a target, -j8)")
+    s.set_defaults(fn=cmd_build)
+
+    s = sub.add_parser("test", help="compile a few files through the "
+                       "mirror and compare with local compiles")
+    s.add_argument("-n", "--count", type=int, default=5)
+    s.add_argument("-C", dest="build_dir", metavar="DIR")
+    s.add_argument("--match", action="append", metavar="TEXT",
+                   help="only files whose path contains TEXT")
+    s.add_argument("--helper", action="append", metavar="SSH")
+    s.add_argument("--seed", type=int)
+    s.add_argument("--no-compare", action="store_true",
+                   help="skip the local compiles")
+    s.set_defaults(fn=cmd_test)
+
+    s = sub.add_parser("doctor", help="check this machine and the helpers")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("helper", help="manage the daemon on the helpers")
+    s.add_argument("action", choices=["install", "start", "stop", "restart",
+                                      "status", "log", "uninstall"])
+    s.add_argument("host", nargs="*", help="ssh names (default: all)")
+    s.add_argument("-n", "--lines", type=int, default=50,
+                   help="log lines to show")
+    s.set_defaults(fn=cmd_helper)
+
+    s = sub.add_parser("brew-parity", help="compare Homebrew with the "
+                       "helpers and copy missing kegs")
+    s.add_argument("host", nargs="*")
+    s.add_argument("--apply", action="store_true",
+                   help="copy the missing kegs, link and pin them")
+    s.add_argument("--different", action="store_true",
+                   help="with --apply, also replace kegs at other versions")
+    s.add_argument("--only", action="append", metavar="NAMES",
+                   help="only these formulae (comma-separated)")
+    s.set_defaults(fn=cmd_brew_parity)
+
+    args = p.parse_args()
+    if not getattr(args, "fn", None):
+        p.print_help()
+        sys.exit(2)
+    try:
+        args.fn(args)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # Output piped into head and the like.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

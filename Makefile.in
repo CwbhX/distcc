@@ -122,6 +122,7 @@ dist_contrib = contrib/distcc-absolutify	\
 	contrib/distccd-init		\
 	contrib/distccd-on-servers	\
 	contrib/dmake			\
+	contrib/distcc-mirror		\
 	contrib/mirror-build.sh		\
 	contrib/make-j			\
 	contrib/netpwd			\
@@ -1061,6 +1062,7 @@ install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS)
 	for p in $(bin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(bindir)" || exit 1; \
 	done
+	$(INSTALL_SCRIPT) "$(srcdir)/contrib/distcc-mirror" "$(DESTDIR)$(bindir)"
 	for p in $(sbin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(sbindir)" || exit 1; \
 	done
@@ -1184,7 +1186,7 @@ uninstall: uninstall-man uninstall-programs @UNINSTALL_GNOME@ \
 	@UNINSTALL_PUMP@ uninstall-example uninstall-doc uninstall-conf
 
 uninstall-programs:
-	for p in $(bin_PROGRAMS) pump; do			\
+	for p in $(bin_PROGRAMS) pump distcc-mirror; do		\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \
 	  if [ -e "$$file" ]; then rm -fv "$$file"; fi          \
 	done

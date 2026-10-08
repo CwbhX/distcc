@@ -464,9 +464,10 @@ job if it changed.
   the M6.
 - The `-Xpreprocessor` PCH rewrite in `distcc-clang.sh` becomes unnecessary
   for mirrored jobs but is harmless: measured above, the rewritten spelling
-  still loads the PCH when compiling from source. It stays needed for
-  fallback jobs that take the `.ii` path, so leave the wrapper as is.
-  `-emit-pch` already bypasses distcc.
+  still loads the PCH when compiling from source. Fallback jobs that take
+  the `.ii` path no longer need it either: distcc now strips CMake's
+  `-Xclang` PCH pairs from the remote command itself (see Using it with
+  Ohmly). `-emit-pch` already bypasses distcc.
 - The wrapper's `-target` insertion is unaffected. Once this tree is
   installed (configure takes the triple from `$CC -dumpmachine`) it can go.
 
@@ -625,39 +626,58 @@ during that run.
 
 ## Using it with Ohmly
 
-Nothing in Ohmly was changed. On the M6 the new daemon runs next to the
-Homebrew one (which stays on port 3632):
+Nothing in Ohmly was changed. Everything below is driven by
+`contrib/distcc-mirror` (installed as `~/.local/distcc-mirror/bin/distcc-mirror`)
+and its config `~/.config/distcc-mirror/ohmly.conf`:
 
 ```sh
-~/.local/distcc-mirror/bin/distccd --daemon --listen 172.31.250.2 --port 3634 \
-  --allow 172.31.250.1/32 --jobs 14 --mirror-root ~/Git/Ohmly \
-  --log-file ~/Library/Logs/distccd-mirror.log --pid-file ~/.local/distcc-mirror/distccd.pid
+ROOTS=~/Git/Ohmly
+BUILD_DIR=~/Git/Ohmly/build-dev            # a symlink to /Volumes/ExternalSSD/Developer/Ohmly/build-dev
+EXCLUDE=.git:build-release:output:tmp
+EXTRA=~/Github/kicad-mac-builder/build/wxwidgets-dest:~/Github/kicad-mac-builder/build/python-dest:~/Github/kicad-mac-builder/build/ngspice-dest
+HELPERS="m6=172.31.250.2/14"
+LOCAL_JOBS=17
+PORT=3634
+CLIENT_ADDR=172.31.250.1
+PREFIX=~/.local/distcc-mirror
+CCACHE_PREFIX=~/.local/distcc-mirror/bin/distcc
 ```
 
-It was started by hand and does not survive a reboot; a LaunchAgent like
-the existing `com.ohmly.distccd` with these arguments would make it
-permanent. On the host (both binaries are in `~/.local/distcc-mirror`,
-statically linked against popt so they need no Homebrew on the M6):
+It was written by `distcc-mirror init --helper m6=172.31.250.2/14 --build
+build-dev --local-jobs 17 --exclude output:tmp --extra ...`. The
+environment it gives is the one the benchmark set by hand, with
+`DISTCC_MIRROR_PATHMAP` derived from the `BUILD_DIR` symlink. A build is
 
 ```sh
-export OHMLY_DISTCC_BIN=$HOME/.local/distcc-mirror/bin/distcc
-export DISTCC_HOSTS="172.31.250.2:3634/14,mirror localhost/17"
-export DISTCC_MIRROR_ROOTS=$HOME/Git/Ohmly
-export DISTCC_MIRROR_EXCLUDE=".git:build-release:output:tmp"
-export DISTCC_MIRROR_PATHMAP="/Volumes/ExternalSSD/Developer/Ohmly/build-dev=$HOME/Git/Ohmly/build-dev"
-export DISTCC_MIRROR_EXTRA="$HOME/Github/kicad-mac-builder/build/wxwidgets-dest:$HOME/Github/kicad-mac-builder/build/python-dest:$HOME/Github/kicad-mac-builder/build/ngspice-dest"
-export DISTCC_MIRROR_SSH=m6
-export CCACHE_PREFIX=$HOME/Git/Ohmly/dev-tools/distcc-clang.sh
-contrib/mirror-build.sh ~/Git/Ohmly/build-dev -j31     # PCHs, sync, build
+cd ~/Git/Ohmly && distcc-mirror build        # PCHs, sync, ninja -j31
 ```
 
-`dev-tools/ohmly.sh` cannot be used for this unchanged: it checks that
-`~/.distcc/hosts` names `172.31.250.2` without options, and it does not run
-the sync. `dev-tools/distcc-clang.sh` keeps working (its `-Xpreprocessor`
-rewrite is still what the classic fallback needs); its per-job
-`/usr/bin/clang -dumpmachine` (about 35 ms of host CPU per job) is no longer
-needed with this tree's client. distcc now also keeps PCH generation local
-by itself (`-x *-header`, `-emit-pch`), as the wrapper already did.
+`distcc-mirror helper install` replaces the hand-started M6 daemon (port
+3634, `--jobs 14`, `--mirror-root ~/Git/Ohmly`) with a LaunchAgent
+(`local.distcc-mirror.distccd.3634`), next to the Homebrew one on 3632.
+`distcc-mirror doctor` checks both Macs, and `distcc-mirror test` compiles
+random Ohmly TUs on the M6 and compares them with local compiles: 6 of 6
+mirrored and byte-identical, and 4 of 4 PCH TUs through ccache with
+`CCACHE_PREFIX` pointing at distcc directly.
+
+`dev-tools/distcc-clang.sh` is no longer needed with this tree:
+
+- its target triple fix was for Homebrew 3.4's `arm-apple-darwin` (this
+  build uses `arm64-apple-darwin27.0.0`, and Ohmly's absolute
+  `/usr/bin/clang++` is not rewritten anyway);
+- distcc now drops CMake's `-Xclang -include-pch -Xclang <pch> -Xclang
+  -include -Xclang <header>` from the remote command of a classic job
+  itself (`dcc_strip_local_args`). The local `-E` has already expanded the
+  PCH, so the remote compile gives an object identical to a direct
+  compile. Before, the remote compile failed, was redone locally, and the
+  helper was backed off for a minute;
+- distcc keeps PCH generation local by itself (`-x *-header`,
+  `-emit-pch`).
+
+Dropping it also saves its per-job `/usr/bin/clang -dumpmachine` (about
+35 ms of host CPU). `dev-tools/ohmly.sh` cannot be used for this unchanged:
+it checks that `~/.distcc/hosts` names `172.31.250.2` without options, and
+it does not run the sync.
 
 ## Expected gain (estimates)
 
