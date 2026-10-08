@@ -76,6 +76,7 @@ void dcc_mirror_job_free(struct dcc_mirror_job *job)
         free(job->env[i]);
     free(job->env);
     dcc_mirror_rules_free(&job->rules);
+    dcc_search_list_free(&job->search);
     memset(job, 0, sizeof *job);
 }
 
@@ -304,6 +305,18 @@ int dcc_mirror_prepare(char **argv, const char *input_fname,
 
     if (dcc_is_preprocessed(input_fname))
         return EXIT_DISTCC_FAILED;
+    /* Dependency output that does not go to a file is the classic path's
+     * business: -MF - (stdout), or the environment variables. */
+    if (getenv("DEPENDENCIES_OUTPUT") || getenv("SUNPRO_DEPENDENCIES"))
+        return EXIT_DISTCC_FAILED;
+    for (i = 0; argv[i]; i++) {
+        if ((strcmp(argv[i], "-MF") == 0 && argv[i + 1]
+             && strcmp(argv[i + 1], "-") == 0)
+            || strcmp(argv[i], "-MF-") == 0) {
+            rs_trace("mirror: -MF - is not supported");
+            return EXIT_DISTCC_FAILED;
+        }
+    }
     if ((ret = mirror_cwd(&job->cwd)))
         return ret;
     if (!under_mirror_roots(job->cwd)) {
@@ -343,6 +356,9 @@ int dcc_mirror_prepare(char **argv, const char *input_fname,
         n[++job->n_env] = NULL;
     }
     if ((ret = dcc_mirror_rules_from_env(&job->rules, job->cwd)))
+        return ret;
+    if ((ret = dcc_mirror_search_list(argv, input_fname, &job->rules, 1,
+                                      &job->search)))
         return ret;
     return 0;
 }
@@ -402,21 +418,15 @@ struct pending_listing {
 /* What deciding about a differing installed directory needs; the search
  * order and component positions are only computed if one differs. */
 struct listing_ctx {
-    char **argv;
+    const struct dcc_search_list *sl;
     char **files;
     int n_files;
     int ready;
-    char **dirs;
-    int n_dirs;
     struct dcc_strint positions;
 };
 
 static void listing_ctx_free(struct listing_ctx *c)
 {
-    int i;
-    for (i = 0; i < c->n_dirs; i++)
-        free(c->dirs[i]);
-    free(c->dirs);
     dcc_strint_free(&c->positions);
 }
 
@@ -459,11 +469,8 @@ static int listing_acceptable(struct dcc_mirror_job *job,
         return 1;
     }
     if (!c->ready) {
-        if (dcc_mirror_search_order(c->argv, &job->rules, &c->dirs,
-                                    &c->n_dirs)
-            || dcc_mirror_component_positions(c->files, c->n_files, c->dirs,
-                                              c->n_dirs, &job->rules,
-                                              &c->positions)) {
+        if (dcc_mirror_component_positions(c->files, c->n_files, c->sl,
+                                           &job->rules, &c->positions)) {
             dcc_mirror_free_names(local, n_local);
             return 0;
         }
@@ -473,8 +480,8 @@ static int listing_acceptable(struct dcc_mirror_job *job,
         dcc_mirror_free_names(local, n_local);
         return 0;
     }
-    for (i = 0; i < c->n_dirs; i++) {
-        if (strcmp(c->dirs[i], norm) == 0) {
+    for (i = 0; i < c->sl->n; i++) {
+        if (strcmp(c->sl->d[i].norm, norm) == 0) {
             d = i;
             break;
         }
@@ -532,6 +539,7 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
     struct dcc_strset file_set = { NULL, 0, 0 }, dir_set = { NULL, 0, 0 };
     struct dcc_strset comps = { NULL, 0, 0 };
     struct dcc_strset seen_files = { NULL, 0, 0 }, seen_dirs = { NULL, 0, 0 };
+    struct dcc_strset shadows = { NULL, 0, 0 }, helper_shadows = { NULL, 0, 0 };
     struct pending_listing pl;
     struct listing_ctx lctx;
     char *line, *next, *end = dsta + dsta_len;
@@ -552,10 +560,18 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
         files[i] = dotd_paths[i];
     for (i = 0; i < job->checks.n; i++)
         files[n_dotd + i] = job->checks.items[i].path;
-    if ((ret = dcc_mirror_required(argv, files, n_files, &file_set,
+    (void) argv;
+    if ((ret = dcc_mirror_required(&job->search, files, n_files, &file_set,
                                    &dir_set, &comps)))
         goto out;
-    lctx.argv = argv;
+    /* Files here that would shadow one the compile read; each must also
+     * be on the helper, with the same content (see mirror_search.c). */
+    if ((ret = dcc_mirror_shadow_candidates(&job->search, files, n_files,
+                                            job->checks.items[0].path,
+                                            &job->rules, NULL, NULL,
+                                            &shadows)))
+        goto out;
+    lctx.sl = &job->search;
     lctx.files = files;
     lctx.n_files = n_files;
 
@@ -587,6 +603,24 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
                 MISMATCH(pl.path);
             pending_reset(&pl);
         }
+        if (line[0] == 'C' && line[1] == ' ') {
+            /* A shadow candidate the helper has: "C " + a file line. */
+            if (dcc_mirror_parse_dsta_line(line + 2, &path, &remote) != 0
+                || remote.present != DCC_MIRROR_FILE || !remote.digest[0]) {
+                rs_log_error("mirror: malformed DSTA line: %s", line);
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out;
+            }
+            if (dcc_strset_has(&shadows, path)) {
+                if ((ret = dcc_mirror_ident_of(path, 1, &local)))
+                    goto out;
+                if (!dcc_mirror_ident_equal(&remote, &local, 1))
+                    MISMATCH(path);
+                if ((ret = dcc_strset_add(&helper_shadows, path)))
+                    goto out;
+            }
+            continue;
+        }
         if (dcc_mirror_parse_dsta_line(line, &path, &remote) != 0) {
             rs_log_error("mirror: malformed DSTA line: %s", line);
             ret = EXIT_PROTOCOL_ERROR;
@@ -616,15 +650,15 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
                 goto out;
         }
         if (dcc_strset_has(&file_set, path) && remote.present != DCC_MIRROR_DIR) {
-            int installed = dcc_mirror_is_installed_path(path);
-            if (installed && remote.present == DCC_MIRROR_FILE
-                && !remote.digest[0])
+            /* Files are compared by content: size and mtime cannot show a
+             * same-length edit made within the same second. */
+            if (remote.present == DCC_MIRROR_FILE && !remote.digest[0])
                 MISMATCH(path);
-            if ((ret = dcc_mirror_ident_of(path, installed
-                                           && remote.present == DCC_MIRROR_FILE,
+            if ((ret = dcc_mirror_ident_of(path,
+                                           remote.present == DCC_MIRROR_FILE,
                                            &local)))
                 goto out;
-            if (!dcc_mirror_ident_equal(&remote, &local, installed))
+            if (!dcc_mirror_ident_equal(&remote, &local, 1))
                 MISMATCH(path);
             if ((ret = dcc_strset_add(&seen_files, path)))
                 goto out;
@@ -636,6 +670,16 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
         pending_reset(&pl);
     }
 
+    for (k = 0; k < shadows.cap; k++) {
+        const char *c = shadows.items[k];
+        if (c && !dcc_strset_has(&helper_shadows, c)) {
+            rs_log_info("mirror: %s exists only here and could shadow a "
+                        "file the helper read", c);
+            ret = EXIT_DISTCC_FAILED;
+            *first_mismatch = strdup(c);
+            goto out;
+        }
+    }
     for (k = 0; k < file_set.cap; k++) {
         const char *f = file_set.items[k];
         if (f && !dcc_strset_has(&seen_files, f)) {
@@ -666,6 +710,8 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
     dcc_strset_free(&comps);
     dcc_strset_free(&seen_files);
     dcc_strset_free(&seen_dirs);
+    dcc_strset_free(&shadows);
+    dcc_strset_free(&helper_shadows);
     return ret;
 }
 

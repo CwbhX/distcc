@@ -50,6 +50,7 @@
 #include "mirror.h"
 #include "mirror_serve.h"
 #include "confine.h"
+#include "mirror_search.h"
 
 /* Options that write files or load code we do not track.  Refused even
  * though the confinement would stop the writes, so that the reason is clear
@@ -212,6 +213,36 @@ static int testing_hook(const char *var, const char *path)
     return v && *v && strcmp(v, path) == 0;
 }
 
+/* Test hook: DISTCC_TESTING_MIRROR_DOTD_FROM/_TO replace a string in the
+ * .d, as if the helper had read another file. */
+static int testing_rewrite_dotd(char **text)
+{
+    const char *from = getenv("DISTCC_TESTING_MIRROR_DOTD_FROM");
+    const char *to = getenv("DISTCC_TESTING_MIRROR_DOTD_TO");
+    char *out, *p, *hit;
+    size_t fl, tl, n = 0;
+
+    if (!from || !*from || !to)
+        return 0;
+    fl = strlen(from);
+    tl = strlen(to);
+    for (p = *text; (hit = strstr(p, from)); p = hit + fl)
+        n++;
+    if (!n)
+        return 0;
+    if (!(out = malloc(strlen(*text) + n * (tl > fl ? tl - fl : 0) + 1)))
+        return EXIT_OUT_OF_MEMORY;
+    out[0] = '\0';
+    for (p = *text; (hit = strstr(p, from)); p = hit + fl) {
+        strncat(out, p, (size_t) (hit - p));
+        strcat(out, to);
+    }
+    strcat(out, p);
+    free(*text);
+    *text = out;
+    return 0;
+}
+
 static void testing_skew(struct dcc_mirror_ident *ident)
 {
     ident->mtime += 7;
@@ -226,6 +257,38 @@ static char *opened_path(const struct dcc_mirror_rules *r, const char *path)
                                   path);
 }
 
+static char *resolve_cb(const void *ctx, const char *path)
+{
+    return opened_path((const struct dcc_mirror_rules *) ctx, path);
+}
+
+/* Append a "C" line: a shadow candidate that exists here. */
+static int dsta_append_candidate(char **buf, size_t *len, size_t *cap,
+                                 const char *path,
+                                 const struct dcc_mirror_rules *r)
+{
+    struct dcc_mirror_ident ident;
+    char *opened, *line;
+    int ret;
+
+    if (testing_hook("DISTCC_TESTING_MIRROR_OMIT", path))
+        return 0;
+    if (!(opened = opened_path(r, path)))
+        return EXIT_OUT_OF_MEMORY;
+    ret = dcc_mirror_ident_of(opened, 1, &ident);
+    free(opened);
+    if (ret)
+        return ret;
+    if (ident.present != DCC_MIRROR_FILE)
+        return 0;
+    if ((ret = dcc_mirror_format_dsta_line(path, &ident, &line)))
+        return ret;
+    if (!(ret = buf_append(buf, len, cap, "C ")))
+        ret = buf_append(buf, len, cap, line);
+    free(line);
+    return ret;
+}
+
 /* Append the DSTA line for file @p path. */
 static int dsta_append(char **buf, size_t *len, size_t *cap,
                        const char *path, const struct dcc_mirror_rules *r)
@@ -238,13 +301,17 @@ static int dsta_append(char **buf, size_t *len, size_t *cap,
         return 0;
     if (!(opened = opened_path(r, path)))
         return EXIT_OUT_OF_MEMORY;
-    ret = dcc_mirror_ident_of(opened, dcc_mirror_is_installed_path(opened),
-                              &ident);
+    /* Content, not mtime: see dcc_mirror_verify. */
+    ret = dcc_mirror_ident_of(opened, 1, &ident);
     free(opened);
     if (ret)
         return ret;
     if (testing_hook("DISTCC_TESTING_MIRROR_SKEW", path))
         testing_skew(&ident);
+    if (testing_hook("DISTCC_TESTING_MIRROR_CONTENT", path)
+        && ident.digest[0])
+        /* Same size and mtime, other content (a same-second edit). */
+        ident.digest[0] = ident.digest[0] == '0' ? '1' : '0';
     return dsta_append_ident(buf, len, cap, path, &ident);
 }
 
@@ -443,7 +510,8 @@ int dcc_mirror_serve(int in_fd, int out_fd,
     struct dcc_mirror_checklist checks = { NULL, 0, 0 };
     struct dcc_mirror_rules rules;
     struct dcc_strset file_set = { NULL, 0, 0 }, dir_set = { NULL, 0, 0 };
-    struct dcc_strset comps = { NULL, 0, 0 };
+    struct dcc_strset comps = { NULL, 0, 0 }, shadows = { NULL, 0, 0 };
+    struct dcc_search_list search = { NULL, 0 };
     unsigned n_checks, i;
     int code = DCC_MIRR_OK, ret = 0, status = 0, confine_failed = 0;
     int changed_dir = 0;
@@ -564,6 +632,17 @@ int dcc_mirror_serve(int in_fd, int out_fd,
         REFUSE(DCC_MIRR_COMPILER, "compiler %s differs from the client's",
                argv[0]);
 
+    /* The include search path, as the client computes it (the compiler
+     * may have been renamed by DISTCC_CMDLIST). */
+    free(client_argv[0]);
+    if (!(client_argv[0] = strdup(argv[0]))) {
+        ret = EXIT_OUT_OF_MEMORY;
+        goto out;
+    }
+    if (dcc_mirror_search_list(client_argv, *input_ret, &rules, 1, &search))
+        REFUSE(DCC_MIRR_ARG_POLICY, "an include search option or the "
+               "compiler's search path is not supported");
+
     /* Pre-check: synced-tree files must have the client's size and mtime.
      * Installed-tree files are compared by digest after the compile. */
     for (i = 0; i < (unsigned) checks.n; i++) {
@@ -657,6 +736,7 @@ int dcc_mirror_serve(int in_fd, int out_fd,
     if (!WIFSIGNALED(status) && WEXITSTATUS(status) == 0) {
         int n_files;
         if ((ret = dcc_load_file_string(dotd_fname, &dotd_text))
+            || (ret = testing_rewrite_dotd(&dotd_text))
             || (ret = dcc_mirror_parse_dotd(dotd_text, strlen(dotd_text),
                                             &dotd_paths, &n_dotd)))
             goto out;
@@ -669,9 +749,18 @@ int dcc_mirror_serve(int in_fd, int out_fd,
             files[i] = dotd_paths[i];
         for (i = 0; i < (unsigned) checks.n; i++)
             files[n_dotd + i] = checks.items[i].path;
-        if ((ret = dcc_mirror_required(client_argv, files, n_files,
-                                       &file_set, &dir_set, &comps)))
+        if ((ret = dcc_mirror_required(&search, files, n_files,
+                                       &file_set, &dir_set, &comps))
+            || (ret = dcc_mirror_shadow_candidates(&search, files, n_files,
+                                                   *input_ret, &rules,
+                                                   resolve_cb, &rules,
+                                                   &shadows)))
             goto out;
+        for (k = 0; k < shadows.cap; k++)
+            if (shadows.items[k]
+                && (ret = dsta_append_candidate(&dsta, &dsta_len, &dsta_cap,
+                                                shadows.items[k], &rules)))
+                goto out;
         for (k = 0; k < file_set.cap; k++)
             if (file_set.items[k]
                 && (ret = dsta_append(&dsta, &dsta_len, &dsta_cap,
@@ -731,6 +820,8 @@ int dcc_mirror_serve(int in_fd, int out_fd,
     dcc_strset_free(&file_set);
     dcc_strset_free(&dir_set);
     dcc_strset_free(&comps);
+    dcc_strset_free(&shadows);
+    dcc_search_list_free(&search);
     remove_tree_contents(job_dir);
     free(job_dir);
     free(obj_fname);

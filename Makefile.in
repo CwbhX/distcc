@@ -243,6 +243,7 @@ common_obj = src/arg.o src/argutil.o					\
 	src/safeguard.o src/snprintf.o src/timeval.o			\
 	src/dotd.o 							\
 	src/mirror.o src/mirror_digest.o src/mirror_ident.o		\
+	src/mirror_search.o						\
 	src/sha256.o							\
 	src/hosts.o src/hostfile.o					\
 	src/implicit.o src/loadfile.o					\
@@ -316,7 +317,7 @@ h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/timefile.o \
 		src/ssh.o src/strip.o src/cpp.o src/mirror_client.o \
 		@AUTH_DISTCC_OBJS@
 h_getline_obj = src/h_getline.o $(common_obj)
-h_mirror_obj = src/h_mirror.o $(common_obj)
+h_mirror_obj = src/h_mirror.o src/confine.o $(common_obj)
 
 # All source files, for the purposes of building the distribution
 SRC =	src/stats.c							\
@@ -333,7 +334,7 @@ SRC =	src/stats.c							\
 	src/h_sa2str.c src/h_scanargs.c src/h_strip.c			\
 	src/h_dotd.c src/h_compile.c src/h_getline.c			\
 	src/h_mirror.c src/mirror.c src/mirror_digest.c src/sha256.c	\
-	src/mirror_ident.c						\
+	src/mirror_ident.c src/mirror_search.c				\
 	src/confine.c src/mirror_client.c src/mirror_serve.c		\
 	src/mirror_sync.c						\
 	src/help.c src/history.c src/hosts.c src/hostfile.c		\
@@ -380,6 +381,7 @@ HEADERS = src/stats.h							\
 	src/dotd.h src/include_server_if.h				\
 	src/mirror.h src/sha256.h src/confine.h				\
 	src/mirror_client.h src/mirror_serve.h src/mirror_sync.h	\
+	src/mirror_search.h						\
 	src/emaillog.h 							\
 	src/va_copy.h 							\
 	src/zeroconf.h

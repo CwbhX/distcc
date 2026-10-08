@@ -25,6 +25,7 @@
  *   h_mirror dotd FILE          print the prerequisites of a .d file
  *   h_mirror ident FILE         print the DSTA line for FILE
  *   h_mirror dsta LINE          parse a DSTA line and print it back
+ *   h_mirror confine -          print "yes" if write confinement works
  */
 
 #include <config.h>
@@ -39,6 +40,7 @@
 #include "trace.h"
 #include "exitcode.h"
 #include "mirror.h"
+#include "confine.h"
 
 const char *rs_program_name = __FILE__;
 
@@ -88,6 +90,9 @@ int main(int argc, char *argv[])
             return ret;
         fputs(line, stdout);
         free(line);
+    } else if (strcmp(argv[1], "confine") == 0) {
+        printf("%s\n", dcc_confine_available() && dcc_confine_probe() == 0
+               ? "yes" : "no");
     } else if (strcmp(argv[1], "dsta") == 0) {
         struct dcc_mirror_ident ident;
         char *copy = strdup(argv[2]), *path, *line;

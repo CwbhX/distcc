@@ -24,6 +24,7 @@
 #define DISTCC_MIRROR_CLIENT_H
 
 #include "mirror.h"
+#include "mirror_search.h"
 
 struct dcc_mirror_job {
     char *cwd;                          /* CDIR, after DISTCC_MIRROR_PATHMAP */
@@ -32,6 +33,7 @@ struct dcc_mirror_job {
     char **env;                         /* ENVS: NAME=VALUE */
     int n_env;
     struct dcc_mirror_rules rules;      /* RULE */
+    struct dcc_search_list search;      /* include search path */
     char **argv;                        /* what was sent, for the check */
 };
 

@@ -116,6 +116,7 @@ static int apply_profile(const char *profile)
 }
 #endif
 
+#ifdef HAVE_SEATBELT
 /* Close every descriptor from 3 up except @p keep. */
 static void close_other_fds(int keep)
 {
@@ -127,6 +128,7 @@ static void close_other_fds(int keep)
         if (fd != keep)
             close(fd);
 }
+#endif
 
 /**
  * Run @p argv in a child that may write only inside @p job_dir.

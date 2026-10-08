@@ -2339,6 +2339,12 @@ class Mirror_Case(Compilation_Case):
     the job went with mirror_expect()."""
 
     def setup(self):
+        # Mirror mode needs write confinement (macOS Seatbelt); elsewhere
+        # the daemon rightly refuses --mirror-root.
+        out, err = self.runcmd("h_mirror confine -")
+        if out.strip() != "yes":
+            raise comfychair.NotRunError(
+                "mirror mode needs write confinement, not available here")
         self.mirror_root = os.getcwd()
         f = open("cmdlist", "w")
         f.write(self._cc_path() + "\n")
@@ -2553,6 +2559,103 @@ class MirrorInstalledLater_Case(MirrorInstalledHarmless_Case):
         # inc (with sub.h) is searched before inst.
         return Mirror_Case.compileOpts(self) + \
             " -I%s -include used.h" % _ShellSafe(os.path.abspath("inst"))
+
+
+class MirrorSameSecond_Case(MirrorRejected_Case):
+    """Same size and mtime, other content (a same-second edit): rejected,
+    because files are compared by content."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_CONTENT': 'inc/sub.h'}
+    def expected_reason(self):
+        return "inc/sub.h differs from the helper's copy"
+
+
+class MirrorShadowBase_Case(MirrorRejected_Case):
+    """<sub/val.h> with an early and a late search directory.  The daemon
+    reports (through test hooks) that it read late/sub/val.h and has no
+    early/sub/val.h; this machine has both, so its own compile would read
+    early/sub/val.h.  Subclasses vary how the directories are given."""
+    def createSource(self):
+        Mirror_Case.createSource(self)
+        for d in ("early/sub", "late/sub"):
+            os.makedirs(d)
+        open("early/sub/other.h", "w").write("\n")
+        open("early/sub/val.h", "w").write("#define VAL 1\n")
+        open("late/sub/val.h", "w").write("#define VAL 1\n")
+        open(self.sourceFilename(), "a").write("#include <sub/val.h>\n")
+    def search_opts(self):
+        return "-Iearly -Ilate"
+    def compileOpts(self):
+        return Mirror_Case.compileOpts(self) + " " + self.search_opts()
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_DOTD_FROM': 'early/sub/val.h',
+                'DISTCC_TESTING_MIRROR_DOTD_TO': 'late/sub/val.h',
+                'DISTCC_TESTING_MIRROR_OMIT': self.early_candidate()}
+    def early_candidate(self):
+        return "early/sub/val.h"
+    def expected_reason(self):
+        return "early/sub/val.h exists only here and could shadow"
+
+
+class MirrorNestedShadow_Case(MirrorShadowBase_Case):
+    """-Iearly -Ilate: early/sub exists on both sides."""
+
+
+class MirrorJoinedShadow_Case(MirrorShadowBase_Case):
+    """-isystemearly -isystemlate (joined operands)."""
+    def search_opts(self):
+        return "-isystemearly -isystemlate"
+    def early_candidate(self):
+        return "early/sub/val.h"
+
+
+class MirrorCpathShadow_Case(MirrorShadowBase_Case):
+    """CPATH=early:late."""
+    def search_opts(self):
+        return ""
+    def setupEnv(self):
+        MirrorShadowBase_Case.setupEnv(self)
+        os.environ['CPATH'] = "early:late"
+    def teardown(self):
+        os.environ.pop('CPATH', None)
+        MirrorShadowBase_Case.teardown(self)
+
+
+class MirrorDuplicateHarmless_Case(MirrorShadowBase_Case):
+    """The same early duplicate on both sides is not a shadow."""
+    def daemon_env(self):
+        env = MirrorShadowBase_Case.daemon_env(self)
+        del env['DISTCC_TESTING_MIRROR_OMIT']
+        return env
+    def runtest(self):
+        self.compile()
+        self.link()
+        self.checkBuiltProgram()
+        Mirror_Case.mirror_expect(self, self.client_log())
+
+
+class MirrorDepsStdout_Case(Mirror_Case):
+    """-MF - sends the dependencies to stdout, which mirror mode leaves to
+    the classic path."""
+    def compileOpts(self):
+        return "-Iinc -Xclang -include-pch -Xclang pch.h.pch -MD -MF -"
+    def runtest(self):
+        out, err = self.runcmd(self.compileCmd())
+        self.assert_re_search("testtmp.o: ", out)
+        if os.path.exists("-"):
+            self.fail("a file named '-' was written")
+        if re.search("compiled in the mirror", self.client_log()):
+            self.fail("-MF - job was mirrored")
+
+
+class MirrorRefusedOption_Case(Mirror_Case):
+    """A search option mirror mode does not model is not mirrored."""
+    def compileOpts(self):
+        return Mirror_Case.compileOpts(self) + " -iprefix /x -iwithprefix y"
+    def runtest(self):
+        self.compile()
+        if re.search("compiled in the mirror", self.client_log()):
+            self.fail("job with -iprefix was mirrored")
 
 
 class MirrorCompiler_Case(MirrorRejected_Case):
@@ -2770,6 +2873,13 @@ tests = [
          MirrorInstalledHarmless_Case,
          MirrorInstalledShadow_Case,
          MirrorInstalledLater_Case,
+         MirrorSameSecond_Case,
+         MirrorNestedShadow_Case,
+         MirrorJoinedShadow_Case,
+         MirrorCpathShadow_Case,
+         MirrorDuplicateHarmless_Case,
+         MirrorDepsStdout_Case,
+         MirrorRefusedOption_Case,
          MirrorCompiler_Case,
          MirrorNoConfine_Case,
          MirrorOutsideRoot_Case,

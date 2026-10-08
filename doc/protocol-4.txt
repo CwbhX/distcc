@@ -94,7 +94,9 @@ MIRR <code>
     1  mirror mode is off, or the cwd or input is not under a
        --mirror-root
     2  a synced file of the check list differs (pre-check)
-    3  an argument or the compiler was refused
+    3  an argument or the compiler was refused, or the include search
+       uses an option mirror mode does not model (-iprefix, -iwithprefix*,
+       -iwithsysroot, -I-, -ivfsoverlay, ...)
     4  the cwd or the input is missing
     5  the compiler could not be confined to its job directory
     6  the server's compiler binary is not the client's
@@ -118,8 +120,7 @@ DOTD <len> <bytes>
 DSTA <len> <bytes>
     Text, one line per item:
 
-      F <size> <mtime> <sha256|-> <path>   a regular file; the digest is
-                                           given for installed trees
+      F <size> <mtime> <sha256> <path>     a regular file
       D <hash> <path>                      a directory: the SHA-256 of its
                                            sorted entries
       L <hash> <path>                      the same, for a directory in an
@@ -128,24 +129,37 @@ DSTA <len> <bytes>
                                            for a dangling symlink)
       A <path>                             absent
       O <path>                             neither file nor directory
+      C <size> <mtime> <sha256> <path>     a shadow candidate (below) that
+                                           exists on the server
 
     It must describe every prerequisite of the .d and every check-list
-    path (as files), and every directory argv adds to the include search,
-    the directory of each of those files, and "." (as directories).
+    path (as files), and every directory of the include search path given
+    by argv or the environment (CPATH, C_INCLUDE_PATH, ...), the directory
+    of each of those files, and "." (as directories).
+
+    Shadow candidates: for each file read (except the input), spelled S
+    relative to the search directory it lies in (the search path includes
+    the compiler's implicit directories, from "<compiler> -E -v"), every
+    S in an earlier search directory, and, if S has a directory part,
+    every S in the directory of a file read, that exists but was not read.
 
 client check
 ------------
 
 The client parses the .d itself, derives the same sets, and requires each
-item to be described.  Files in installed trees must have the same size and
-SHA-256; other files the same size and mtime (seconds).  Directories
-outside installed trees must have the same entry hash.  An installed
+item to be described.  Files must have the same size and SHA-256 (mtimes
+are not enough: a same-length edit within one second keeps both size and
+whole-second mtime).  Each shadow candidate that exists on the client must
+be among the server's C lines with the same content: a file only the
+client has would make the client's own compile read something else.
+Directories outside installed trees must have the same entry hash.  An installed
 directory may differ only in entries whose names are not a component of
 any path the compile read ("X.framework" also counts as "X"), since an
 include spelling is always a suffix of the path it resolved to.  Paths
 are stat()ed with symlinks followed, from the client's own cwd.
 
 Only then are the object and the .d written next to their destinations and
-renamed into place.  On any mismatch, or a nonzero MIRR, or a failed
+renamed into place.  Jobs whose dependency output does not go to a file
+(-MF -, DEPENDENCIES_OUTPUT, SUNPRO_DEPENDENCIES) are not mirrored.  On any mismatch, or a nonzero MIRR, or a failed
 compile, the job is sent to the same host by protocol 1/2 instead; the
 host is not marked as bad.

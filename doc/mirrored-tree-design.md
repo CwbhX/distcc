@@ -286,8 +286,8 @@ the host's current one: two PCHs built from the same, unchanged header that
 uses `__TIME__` differ in content and give different program output, yet
 clang accepts either one with `-Winvalid-pch`, and the `.d` files and the
 metadata of every path they list are identical (reproduced with Apple clang
-on both Macs). Only the PCH file's own mtime tells them apart: both PCHs
-were 825,820 bytes.
+on both Macs). Only the PCH file itself tells them apart: both PCHs were
+825,820 bytes, so its content must be compared.
 
 Two checks, in order:
 
@@ -303,62 +303,71 @@ Two checks, in order:
   Tools mismatch therefore shows up as a post-check failure, as well as a PCH
   load error.
 
-**File identity** depends on how the file got onto the M6. Every path is
-`stat`ed with symlinks followed; size-only is never enough, because a
-same-length edit to a header (one changed digit in a constant) would pass it
-and the wrong object would be cached by ccache under the host's key.
-
-- **Synced trees** (source tree, `build-dev` subset including the PCHs,
-  kicad-mac-builder dest dirs): size and mtime. These are equal on both
-  Macs because the sync copied them with `rsync -a`. Only seconds are
-  compared: openrsync sets whole-second mtimes on the M6 and drops the
-  nanoseconds (measured). This is the cheap path for the files most likely
-  to change, and the only one the PCHs need.
-- **Installed trees** (default `/Library/Developer/CommandLineTools` and
-  `/opt/homebrew`; the same list configured on client and daemon): size and
-  SHA-256 of the content. Their mtimes cannot be relied on to agree across
-  machines even when the content does (see Facts), and aligning them would
-  mean writing into root-owned CLT directories after every update. The
-  daemon sends the digest in `DSTA`; the client compares it with its own and
-  treats a path under an installed tree without a digest as a mismatch.
+**File identity** is size and SHA-256 of the content, for every file,
+`stat`ed with symlinks followed. Metadata is not enough anywhere: size-only
+misses a same-length edit (one changed digit in a constant), and size plus
+whole-second mtime misses the same edit made within the second (openrsync
+also drops the nanoseconds on the M6, and installed trees need not share
+mtimes at all; see Facts). A review reproduced exactly that: local result
+1, helper result 2, accepted. A wrong object would be cached by ccache
+under the host's key.
 
 Digests are cached on each side, keyed by the resolved file's device,
 inode, size, nanosecond mtime and ctime; any write to the file changes its
 ctime, so a cache hit can only return the digest of the current content.
-Measured on the host: the 6413 Homebrew and CLT headers Ohmly reads total
-61 MB and hash in 0.28 s (`shasum -a 256`), and a TU such as
-`pcb_edit_frame.cpp` reads about 2200 of them, so an uncached job pays
-about 0.1 s on each side and a cached one only the `stat`s (0.05 s for all
-6413). The distcc client is one process per job, so its cache has to live
-on disk.
+A cache hit costs only the `stat` the check makes anyway; a miss hashes
+the file once (the 6413 Homebrew and CLT headers Ohmly reads total 61 MB
+and hash in 0.28 s; a changed PCH, 40-113 MB, is hashed once after it is
+rebuilt). The distcc client is one process per job, so its cache has to
+live on disk.
 
-**Directory identity: include-search shadowing.** Comparing the files a
-compile read is not enough. If the client has a header in a directory
-searched before the one where the helper found its copy (a header added
-after the sync, a directory filtered out of the sync, an `-I` directory
-missing on the helper), the client's own compile would read a different
-file although every listed file matches. So `DSTA` also describes every
-directory that took part in the include search: every `-I`, `-isystem`,
-`-iquote`, `-idirafter`, `-F` and `-iframework` operand, the directory of
-every file read (this covers the includer's directory for `"..."`
-includes), and the cwd. A directory's identity is the SHA-256 of its sorted
-entries (`<kind><name>`, the kind of a symlink being its target's),
-ignoring what the sync deliberately leaves out: the top-level excludes of
-each root, and in build trees every file that is not a source, header or
-PCH (so objects written during the build do not count).
+**Include-search shadowing.** Comparing the files a compile read is not
+enough. If the client has a header somewhere the search reaches before the
+place the helper found its copy (a header added after the sync, a file
+filtered out of it, a Homebrew package only the client has), the client's
+own compile would read a different file although every listed file
+matches. Two checks cover this (`src/mirror_search.c`):
 
-- Synced directories must have the same identity.
-- Installed directories (`/opt/homebrew/include` on the M6 has 45 entries,
-  the host's 180) are sent with their entries and may differ only in names
-  that are not a component of any path the compile read (`X.framework` also
-  counts as `X`): an include spelling is always a suffix of the path it
-  resolved to, so a header that could shadow it has its first component
-  among those names. The check is order-blind, so it can reject a job whose
-  differing directory comes later in the search; on Ohmly one name, `fmt`,
-  does so for 115 of 3491 TUs, which then take the classic path.
+- **Shadow candidates.** Both sides compute the include search path in
+  order: `-iquote`; `-I` and `-F` with `CPATH`; `-isystem` and
+  `-iframework` with `C_INCLUDE_PATH`, `CPLUS_INCLUDE_PATH`,
+  `OBJC_INCLUDE_PATH` and `OBJCPLUS_INCLUDE_PATH`; the compiler's implicit
+  directories (asked from the compiler once with `-E -v` for each compiler
+  binary and set of relevant flags, and cached in `$DISTCC_DIR`); and
+  `-idirafter`. Joined (`-isystemdir`), separate and `=` spellings are all
+  parsed; options the mirror does not model (`-iprefix`, `-iwithprefix*`,
+  `-iwithsysroot`, `-I-`, `-ivfsoverlay`, `-index-header-map`, ...) keep
+  the job off the mirror. For each file read (except the input), spelled S
+  relative to the search directory it lies in, the candidates are S in
+  every earlier search directory and, when S has a directory part (`a/b.h`),
+  S in the directory of every file read (a `"..."` include looks in the
+  includer's directory first). Each side lists the candidates that exist
+  there but were not read (a candidate that was read is an `#include_next`
+  chain, as libc++'s `stdint.h` does, not a shadow). The client accepts
+  only if each of its candidates is also on the helper with the same
+  content: when the trees match, both see the same harmless duplicates; a
+  file only the client has is exactly what would make its own compile read
+  something else. On Ohmly a host-only version of this rule (reject any
+  existing candidate) would have rejected 2.6% of TUs for duplicates such
+  as `include/ohmly_ai/...` and `common/ohmly_ai/...`; comparing with the
+  helper's list rejects none of them.
+- **Directory entries.** `DSTA` also describes every search directory, the
+  directory of every file read and the cwd by the SHA-256 of its sorted
+  entries (`<kind><name>`, a symlink's kind being its target's), ignoring
+  what the sync deliberately leaves out: the top-level excludes of each
+  root, and in build trees every file that is not a source, header or PCH
+  (so objects written during the build do not count). This covers a
+  single-component spelling in an includer's directory. Synced directories
+  must match; installed ones (`/opt/homebrew/include` on the M6 has 45
+  entries, the host's 180) may differ in names that are not a component of
+  any path the compile read, or that only matter at a later search
+  position. Directory hashes are cached like file digests.
 
-Directory hashes are cached like file digests, keyed by the directory's
-`stat` (an entry added or removed changes its mtime and ctime).
+The M6 lacking Homebrew's `fmt` makes 19 Ohmly TUs (0.5%) fail the
+candidate check: Ohmly's own `fmt` is found first, but `/opt/homebrew/include`
+is also the directory of headers those TUs read, so a `"fmt/base.h"` from
+one of them would find Homebrew's copy on the host. Copying the host's
+remaining Homebrew kegs to the M6 would remove these rejections.
 
 **Compiler identity and environment.** The `.d` does not list the
 compiler, and ccache keys on the host's compiler, so a helper with another
@@ -370,11 +379,11 @@ resolved through `DEVELOPER_DIR` or the xcode-select link); a mismatch is
 `DEVELOPER_DIR`, `MACOSX_DEPLOYMENT_TARGET`, `CCC_OVERRIDE_OPTIONS`, ...)
 are forwarded and set exactly for the compiler.
 
-The remaining blind spots: in synced trees, an edit that keeps both size
-and mtime (ninja makes the same assumption); files read but not listed in
-the `.d` (`.incbin`, possibly `#embed`); a `..` spelling that leaves an
-installed directory; and a dangling symlink in an installed tree whose
-target appears without the directory changing.
+The remaining blind spots: files read but not listed in the `.d`
+(`.incbin`, possibly `#embed`); and a symlink in an installed directory
+whose target appears or disappears without the directory itself changing.
+Jobs whose dependency output does not go to a file (`-MF -`,
+`DEPENDENCIES_OUTPUT`, `SUNPRO_DEPENDENCIES`) take the classic path.
 
 What happens when stale:
 
@@ -503,7 +512,10 @@ never calls `dcc_lock_local_cpp`.
 
 Each is a case in `test/testdistcc.py` (localhost; the daemon describes a
 file or directory differently through `DISTCC_TESTING_MIRROR_*` hooks, so
-staleness can be produced on one machine). "Rejected" means the remote
+staleness can be produced on one machine). The cases that compile in the
+mirror run only where write confinement is available (`h_mirror confine`,
+macOS today) and are skipped elsewhere, as on the Linux CI job; the helper
+and startup-refusal cases run everywhere. "Rejected" means the remote
 object is not used, the job goes the classic way, and the result is still
 right.
 
@@ -514,6 +526,11 @@ right.
 | Same-size header change | `MirrorStaleHeader_Case` |
 | A file or a search directory missing from `DSTA` | `MirrorOmittedFile_Case`, `MirrorOmittedDir_Case` |
 | Shadowing: a synced search directory differs | `MirrorShadow_Case` |
+| Same size and mtime, other content (same-second edit) | `MirrorSameSecond_Case` |
+| Nested shadowing (`<sub/val.h>`, `early/sub` on both sides) with `-I`, joined `-isystem`, and `CPATH` | `MirrorNestedShadow_Case`, `MirrorJoinedShadow_Case`, `MirrorCpathShadow_Case` |
+| The same duplicate on both sides is accepted | `MirrorDuplicateHarmless_Case` |
+| `-MF -` keeps dependencies on stdout (classic path) | `MirrorDepsStdout_Case` |
+| Unsupported search option (`-iprefix`) is not mirrored | `MirrorRefusedOption_Case` |
 | Installed directory lacks an unrelated entry (accepted) / an entry a path was spelled through (rejected) | `MirrorInstalledHarmless_Case`, `MirrorInstalledShadow_Case` |
 | Helper compiler differs (`MIRR 6`) | `MirrorCompiler_Case` |
 | Confinement unavailable per job (`MIRR 5`) | `MirrorNoConfine_Case` |
@@ -582,6 +599,13 @@ The remaining rejection: a TU for which `/opt/homebrew/include` (where the
 M6 lacks Homebrew's `fmt`) comes before the directory its `fmt` headers
 could have been found through, so the helper's result is rightly not
 trusted.
+
+After a review (content identity for every file, shadow candidates
+including nested spellings, `CPATH` and joined options), a rerun with the
+same slot counts produced objects byte-identical to the local run for all
+3481 TUs except `build_version.cpp`, with 19 conservative rejections (the
+`fmt` case above). Its time (294 s) is not comparable: the host was in use
+during that run.
 
 ## Using it with Ohmly
 

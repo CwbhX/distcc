@@ -135,8 +135,9 @@ int dcc_mirror_dir_ident(const char *path, const struct dcc_mirror_rules *r,
                          struct dcc_mirror_ident *ident,
                          char ***names_ret, int *n_names);
 void dcc_mirror_free_names(char **names, int n);
-int dcc_mirror_search_dirs(char **argv, char ***dirs_ret, int *n_ret);
-int dcc_mirror_required(char **argv, char **files, int n_files,
+struct dcc_search_list;
+int dcc_mirror_required(const struct dcc_search_list *sl,
+                        char **files, int n_files,
                         struct dcc_strset *file_set,
                         struct dcc_strset *dir_set,
                         struct dcc_strset *comps);
@@ -148,10 +149,8 @@ struct dcc_strint {
 void dcc_strint_free(struct dcc_strint *m);
 int dcc_strint_get(const struct dcc_strint *m, const char *key);
 char *dcc_mirror_normalize(const struct dcc_mirror_rules *r, const char *path);
-int dcc_mirror_search_order(char **argv, const struct dcc_mirror_rules *r,
-                            char ***dirs_ret, int *n_ret);
 int dcc_mirror_component_positions(char **files, int n_files,
-                                   char **dirs, int n_dirs,
+                                   const struct dcc_search_list *sl,
                                    const struct dcc_mirror_rules *r,
                                    struct dcc_strint *m);
 char *dcc_mirror_daemon_path(const struct dcc_mirror_rules *r,

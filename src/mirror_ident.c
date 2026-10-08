@@ -54,6 +54,7 @@
 #include "trace.h"
 #include "exitcode.h"
 #include "mirror.h"
+#include "mirror_search.h"
 
 /* ----- string sets ----- */
 
@@ -549,52 +550,6 @@ int dcc_mirror_dir_ident(const char *path, const struct dcc_mirror_rules *r,
 
 /* ----- what a job must describe ----- */
 
-/* Search-path options and whether their operand is a directory. */
-static const char *const search_options[] = {
-    "-I", "-isystem", "-iquote", "-idirafter", "-F", "-iframework",
-    "-iframeworkwithsysroot", "-isystem-after", "--include-directory",
-    NULL
-};
-
-/**
- * The directories argv adds to the include search, in order.
- **/
-int dcc_mirror_search_dirs(char **argv, char ***dirs_ret, int *n_ret)
-{
-    char **dirs = NULL;
-    int n = 0, i, j, ret;
-
-    for (i = 0; argv[i]; i++) {
-        const char *a = argv[i];
-        const char *val = NULL;
-        if (strcmp(a, "-Xclang") == 0 || strcmp(a, "-Xpreprocessor") == 0) {
-            i++;
-            continue;
-        }
-        for (j = 0; search_options[j]; j++) {
-            size_t len = strlen(search_options[j]);
-            if (strcmp(a, search_options[j]) == 0) {
-                val = argv[i + 1];
-                if (val)
-                    i++;
-                break;
-            }
-            if (strncmp(a, search_options[j], len) == 0 && a[len]
-                && (len == 2 || a[len] == '=')) {
-                val = a + len + (a[len] == '=');
-                break;
-            }
-        }
-        if (val && *val && (ret = add_str(&dirs, &n, val))) {
-            free_strs(dirs, n);
-            return ret;
-        }
-    }
-    *dirs_ret = dirs;
-    *n_ret = n;
-    return 0;
-}
-
 static char *dirname_of(const char *path)
 {
     const char *slash = strrchr(path, '/');
@@ -629,25 +584,22 @@ static int add_components(struct dcc_strset *comps, const char *path)
 }
 
 /**
- * From argv and the files a job read (the .d prerequisites and the check
- * list), the files and directories the daemon must describe and the
- * component names used to judge differences in installed directories.
+ * From the search path and the files a job read (the .d prerequisites and
+ * the check list), the files and directories the daemon must describe and
+ * the component names used to judge differences in installed directories.
  **/
-int dcc_mirror_required(char **argv, char **files, int n_files,
+int dcc_mirror_required(const struct dcc_search_list *sl,
+                        char **files, int n_files,
                         struct dcc_strset *file_set,
                         struct dcc_strset *dir_set,
                         struct dcc_strset *comps)
 {
-    char **dirs;
-    int n_dirs, i, ret;
+    int i, ret;
 
     if ((ret = dcc_strset_add(dir_set, ".")))
         return ret;
-    if ((ret = dcc_mirror_search_dirs(argv, &dirs, &n_dirs)))
-        return ret;
-    for (i = 0; i < n_dirs && !ret; i++)
-        ret = dcc_strset_add(dir_set, dirs[i]);
-    free_strs(dirs, n_dirs);
+    for (i = 0; i < sl->n && !ret; i++)
+        ret = dcc_strset_add(dir_set, sl->d[i].spelled);
     for (i = 0; i < n_files && !ret; i++) {
         char *d;
         if ((ret = dcc_strset_add(file_set, files[i])))
@@ -788,62 +740,6 @@ int dcc_mirror_write_overlay(const struct dcc_mirror_rules *r,
     return fclose(f) == 0 ? 0 : EXIT_IO_ERROR;
 }
 
-/**
- * The search directories of argv in the order the preprocessor uses them
- * for <...> includes (quoted-only -iquote directories first, since they
- * come before everything for "..." includes): -iquote, -I and -F, -isystem
- * and -iframework, then -idirafter.  Normalized.
- **/
-int dcc_mirror_search_order(char **argv, const struct dcc_mirror_rules *r,
-                            char ***dirs_ret, int *n_ret)
-{
-    static const char *const order[][4] = {
-        { "-iquote", NULL },
-        { "-I", "--include-directory", "-F", NULL },
-        { "-isystem", "-iframework", "-iframeworkwithsysroot", NULL },
-        { "-idirafter", "-isystem-after", NULL },
-    };
-    char **dirs = NULL;
-    int n = 0, pass, i, j, ret;
-
-    for (pass = 0; pass < 4; pass++) {
-        for (i = 0; argv[i]; i++) {
-            const char *a = argv[i], *val = NULL;
-            if (strcmp(a, "-Xclang") == 0 || strcmp(a, "-Xpreprocessor") == 0) {
-                i++;
-                continue;
-            }
-            for (j = 0; order[pass][j]; j++) {
-                const char *opt = order[pass][j];
-                size_t len = strlen(opt);
-                if (strcmp(a, opt) == 0) {
-                    val = argv[i + 1];
-                    if (val)
-                        i++;
-                    break;
-                }
-                if (strncmp(a, opt, len) == 0 && a[len]
-                    && (len == 2 || a[len] == '=')) {
-                    val = a + len + (a[len] == '=');
-                    break;
-                }
-            }
-            if (val && *val) {
-                char *norm = dcc_mirror_normalize(r, val);
-                if (!norm || (ret = add_str(&dirs, &n, norm))) {
-                    free(norm);
-                    free_strs(dirs, n);
-                    return norm ? ret : EXIT_OUT_OF_MEMORY;
-                }
-                free(norm);
-            }
-        }
-    }
-    *dirs_ret = dirs;
-    *n_ret = n;
-    return 0;
-}
-
 /* ----- component positions: name -> latest search position ----- */
 
 void dcc_strint_free(struct dcc_strint *m)
@@ -949,7 +845,7 @@ static int add_component_positions(struct dcc_strint *m, const char *path,
  * Both the path as written and its normalized form count.
  **/
 int dcc_mirror_component_positions(char **files, int n_files,
-                                   char **dirs, int n_dirs,
+                                   const struct dcc_search_list *sl,
                                    const struct dcc_mirror_rules *r,
                                    struct dcc_strint *m)
 {
@@ -957,11 +853,12 @@ int dcc_mirror_component_positions(char **files, int n_files,
 
     for (f = 0; f < n_files && !ret; f++) {
         char *norm = dcc_mirror_normalize(r, files[f]);
-        int pos = n_dirs;
+        int pos = sl->n;
         if (!norm)
             return EXIT_OUT_OF_MEMORY;
-        for (k = n_dirs - 1; k >= 0; k--) {
-            if (strcmp(dirs[k], "/") == 0 || is_under(norm, dirs[k])) {
+        for (k = sl->n - 1; k >= 0; k--) {
+            if (strcmp(sl->d[k].norm, "/") == 0
+                || is_under(norm, sl->d[k].norm)) {
                 pos = k;
                 break;
             }
