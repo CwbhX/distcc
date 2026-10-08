@@ -478,6 +478,14 @@ class StripArgs_Case(SimpleDistCC_Case):
                  # New options stripped in 0.11
                  ("cc -o nsinstall.o -c -DOSTYPE=\"Linux2.4\" -DOSARCH=\"Linux\" -DOJI -D_BSD_SOURCE -I../dist/include -I../dist/include -I/home/mbp/work/mozilla/mozilla-1.1/dist/include/nspr -I/usr/X11R6/include -fPIC -I/usr/X11R6/include -Wall -W -Wno-unused -Wpointer-arith -Wcast-align -pedantic -Wno-long-long -pthread -pipe -DDEBUG -D_DEBUG -DDEBUG_mbp -DTRACING -g -I/usr/X11R6/include -include ../config-defs.h -DMOZILLA_CLIENT -Wp,-MD,.deps/nsinstall.pp nsinstall.c",
                   "cc -o nsinstall.o -c -fPIC -Wall -W -Wno-unused -Wpointer-arith -Wcast-align -pedantic -Wno-long-long -pthread -pipe -g nsinstall.c"),
+
+                 # CMake's PCH use for clang: preprocessing already did it.
+                 ("clang++ -Winvalid-pch -Xclang -include-pch -Xclang b/cmake_pch.hxx.pch -Xclang -include -Xclang b/cmake_pch.hxx -c -o f.o f.cpp",
+                  "clang++ -Winvalid-pch -c -o f.o f.cpp"),
+                 ("clang -Xclang -imacros -Xclang m.h -Xclang -fno-pch-timestamp -c f.c",
+                  "clang -Xclang -fno-pch-timestamp -c f.c"),
+                 # Not the paired form: left alone.
+                 ("clang -Xclang -include-pch -c f.c", "clang -Xclang -include-pch -c f.c"),
                  )
         for cmd, expect in cases:
             o, err = self.runcmd("h_strip %s" % cmd)
