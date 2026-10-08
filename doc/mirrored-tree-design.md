@@ -377,11 +377,12 @@ matches. Two checks cover this (`src/mirror_search.c`):
   any path the compile read, or that only matter at a later search
   position. Directory hashes are cached like file digests.
 
-The M6 lacking Homebrew's `fmt` makes 19 Ohmly TUs (0.5%) fail the
+While the M6 lacked Homebrew's `fmt`, 19 Ohmly TUs (0.5%) failed the
 candidate check: Ohmly's own `fmt` is found first, but `/opt/homebrew/include`
 is also the directory of headers those TUs read, so a `"fmt/base.h"` from
-one of them would find Homebrew's copy on the host. Copying the host's
-remaining Homebrew kegs to the M6 would remove these rejections.
+one of them would find Homebrew's copy on the host. After the host's
+remaining Homebrew kegs were copied to the M6 (see the M6 setup appendix),
+those TUs compile in the mirror, byte-identical to local compiles.
 
 **Compiler identity and environment.** The `.d` does not list the
 compiler, and ccache keys on the host's compiler, so a helper with another
@@ -745,6 +746,15 @@ not touched.
   Xcode 27.0 (clang-2100.3.34.2, the M6's version) on 2026-10-07; see Facts
   for why Software Update did not offer it at first. This invalidated the
   host's existing PCHs, which the next build regenerates.
+- **All Homebrew formulae (2026-10-07):** the other 87 formulae installed
+  on the host were copied the same way (kegs carry Homebrew's install
+  receipts, so `brew list` on the M6 shows the same 115 formulae), the 81
+  linked on the host linked with `brew link`, and all pinned.
+  `/opt/homebrew/include` is then identical on both Macs except `openssl`,
+  linked by hand on the host and left keg-only on the M6. Five formulae the
+  M6 already had in newer versions were left alone. `brew install` was not
+  used because it installs newer versions than the host's, and mirrored
+  compiles need identical headers; upgrade both Macs together instead.
 - **Not needed:** a `/Volumes/ExternalSSD` volume (the client sends the
   logical cwd, see Facts) and git on the M6 (`distcc --mirror-sync` copies
   the working tree).
