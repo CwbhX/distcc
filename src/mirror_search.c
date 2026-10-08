@@ -326,7 +326,7 @@ static int entries_from_report(char *report, char **entries_ret)
             *suffix = '\0';
             fw = 1;
         }
-        if (strchr(l, '\t')) {
+        if (strpbrk(l, "\t\v")) {
             free(entries);
             return EXIT_DISTCC_FAILED;
         }
@@ -405,6 +405,103 @@ int dcc_mirror_probe_local(void *ctx, char **argv, char **err_ret)
     return 0;
 }
 
+/* The identity of directory @p path now: "<dev>.<ino>", "f" for something
+ * that is not a directory, or "-" if absent. */
+static void dir_identity(const char *path, dcc_mirror_resolve_fn fn,
+                         const void *ctx, char *out, size_t n)
+{
+    char *opened = fn ? fn(ctx, path) : strdup(path);
+    struct stat st;
+
+    if (!opened || stat(opened, &st) == -1)
+        snprintf(out, n, "-");
+    else if (!S_ISDIR(st.st_mode))
+        snprintf(out, n, "f");
+    else
+        snprintf(out, n, "%llu.%llu", (unsigned long long) st.st_dev,
+                 (unsigned long long) st.st_ino);
+    free(opened);
+}
+
+/* Add to @p deps every directory the report names as ignored (missing or
+ * duplicate): whether, and which, directory each one is decides the
+ * order. */
+static int deps_from_report(const char *report, struct dcc_strset *deps)
+{
+    static const char *const phrases[] = {
+        "ignoring nonexistent directory \"",
+        "ignoring duplicate directory \"", NULL
+    };
+    int k, ret = 0;
+
+    for (k = 0; phrases[k] && !ret; k++) {
+        const char *p = report;
+        while (!ret && (p = strstr(p, phrases[k])) != NULL) {
+            const char *start = p + strlen(phrases[k]);
+            const char *end = strchr(start, '"');
+            char *path;
+            if (!end)
+                break;
+            if (!(path = strndup(start, (size_t) (end - start))))
+                return EXIT_OUT_OF_MEMORY;
+            ret = dcc_strset_add(deps, path);
+            free(path);
+            p = end;
+        }
+    }
+    return ret;
+}
+
+/* "<identity>:<path>" for every dependency as it is now, tab-separated. */
+static char *deps_serialize(const struct dcc_strset *deps,
+                            dcc_mirror_resolve_fn fn, const void *ctx)
+{
+    size_t k, len = 1;
+    char *out, ident[64];
+
+    for (k = 0; k < deps->cap; k++)
+        if (deps->items[k])
+            len += strlen(deps->items[k]) + 66;
+    if (!(out = calloc(len, 1)))
+        return NULL;
+    for (k = 0; k < deps->cap; k++) {
+        const char *d = deps->items[k];
+        if (!d)
+            continue;
+        if (strpbrk(d, "\t\v\n")) {
+            free(out);
+            return NULL;        /* cannot be recorded: do not cache */
+        }
+        dir_identity(d, fn, ctx, ident, sizeof ident);
+        if (*out)
+            strcat(out, "\t");
+        strcat(out, ident);
+        strcat(out, ":");
+        strcat(out, d);
+    }
+    return out;
+}
+
+/* Is every recorded dependency (as serialized) still the same? */
+static int deps_still_valid(char *serialized, dcc_mirror_resolve_fn fn,
+                            const void *ctx)
+{
+    char *p, *tok, ident[64];
+
+    for (p = serialized; (tok = strsep(&p, "\t")) != NULL; ) {
+        char *colon = strchr(tok, ':');
+        if (!*tok)
+            continue;
+        if (!colon)
+            return 0;
+        *colon = '\0';
+        dir_identity(colon + 1, fn, ctx, ident, sizeof ident);
+        if (strcmp(ident, tok) != 0)
+            return 0;
+    }
+    return 1;
+}
+
 static int push_arg(char ***v, int *n, int *cap, const char *a)
 {
     if (*n + 2 > *cap) {
@@ -443,7 +540,8 @@ int dcc_mirror_search_list(char **argv, const char *input,
     };
     char cver[DCC_SHA256_HEX_LEN + 1], keyhex[DCC_SHA256_HEX_LEN + 1];
     char **probe = NULL, *fname = NULL, *line = NULL, *report = NULL;
-    char *entries = NULL;
+    char *entries = NULL, *dep_text = NULL, *pre_text = NULL;
+    struct dcc_strset deps = { NULL, 0, 0 };
     const char *lang = input_language(argv, input);
     struct dcc_sha256 ctx;
     uint8_t dg[DCC_SHA256_LEN];
@@ -478,14 +576,9 @@ int dcc_mirror_search_list(char **argv, const char *input,
             continue;
         }
         if (match_search_option(argv, i, &o, &val, &consumed)) {
-            /* Whether the directory exists decides whether the compiler
-             * lists it, so it is part of the key. */
-            char *opened = val ? (fn ? fn(fn_ctx, val) : strdup(val)) : NULL;
-            struct stat st;
-            char e = opened && stat(opened, &st) == 0 && S_ISDIR(st.st_mode)
-                ? 'd' : '-';
-            free(opened);
-            dcc_sha256_update(&ctx, &e, 1);
+            /* Which directory it names, if any, decides the order. */
+            if (val && (ret = dcc_strset_add(&deps, val)))
+                break;
             ret = push_arg(&probe, &n, &cap, argv[i]);
             if (!ret && consumed)
                 ret = push_arg(&probe, &n, &cap, argv[++i]);
@@ -508,19 +601,14 @@ int dcc_mirror_search_list(char **argv, const char *input,
         dcc_sha256_update(&ctx, env_keys[i], strlen(env_keys[i]) + 1);
         dcc_sha256_update(&ctx, v ? "=" : "-", 1);
         if (v) {
-            /* Existence of the environment's directories too. */
+            /* The environment's directories are dependencies too. */
             char *copy = strdup(v), *p, *tok;
             dcc_sha256_update(&ctx, v, strlen(v) + 1);
-            for (p = copy; p && (tok = strsep(&p, ":")) != NULL; ) {
-                char *opened = fn ? fn(fn_ctx, *tok ? tok : ".")
-                    : strdup(*tok ? tok : ".");
-                struct stat st;
-                char e = opened && stat(opened, &st) == 0
-                    && S_ISDIR(st.st_mode) ? 'd' : '-';
-                free(opened);
-                dcc_sha256_update(&ctx, &e, 1);
-            }
+            for (p = copy; p && !ret && (tok = strsep(&p, ":")) != NULL; )
+                ret = dcc_strset_add(&deps, *tok ? tok : ".");
             free(copy);
+            if (ret)
+                goto out;
         }
     }
     dcc_sha256_final(&ctx, dg);
@@ -535,6 +623,15 @@ int dcc_mirror_search_list(char **argv, const char *input,
             line[len - 1] = '\0';
             if (strncmp(line, keyhex, DCC_SHA256_HEX_LEN) == 0
                 && line[DCC_SHA256_HEX_LEN] == ' ') {
+                /* "<key> <entries>\v<dependencies>": usable only if every
+                 * directory the order depends on is still the one it was
+                 * (an alias retargeted, a missing directory created). */
+                char *vt = strchr(line, '\v');
+                if (!vt)
+                    continue;
+                *vt = '\0';
+                if (!deps_still_valid(vt + 1, fn, fn_ctx))
+                    continue;
                 ret = entries_parse(sl, r, line + DCC_SHA256_HEX_LEN + 1);
                 fclose(f);
                 goto out;
@@ -543,14 +640,54 @@ int dcc_mirror_search_list(char **argv, const char *input,
         fclose(f);
     }
 
+    /* What the explicit and environment directories are before asking. */
+    pre_text = deps_serialize(&deps, fn, fn_ctx);
     if ((ret = run(run_ctx, probe, &report))) {
         rs_log_info("mirror: could not ask %s for its search path", argv[0]);
         goto out;
     }
-    if ((ret = entries_from_report(report, &entries)))
+    if ((ret = deps_from_report(report, &deps))
+        || (ret = entries_from_report(report, &entries)))
         goto out;
-    if (fname && (f = fopen(fname, "a"))) {
-        fprintf(f, "%s %s\n", keyhex, entries);
+    {
+        /* The listed directories are dependencies as well. */
+        char *copy = strdup(entries), *p, *tok;
+        if (!copy) {
+            ret = EXIT_OUT_OF_MEMORY;
+            goto out;
+        }
+        for (p = copy; !ret && (tok = strsep(&p, "\t")) != NULL; )
+            if (tok[0] && tok[1] == ':' && tok[2])
+                ret = dcc_strset_add(&deps, tok + 2);
+        free(copy);
+        if (ret)
+            goto out;
+    }
+    /* Record the answer with what it depends on; not if one of the
+     * directories changed while the compiler was being asked. */
+    dep_text = deps_serialize(&deps, fn, fn_ctx);
+    if (dep_text && pre_text) {
+        char *copy = strdup(pre_text), *p, *tok;
+        for (p = copy; copy && (tok = strsep(&p, "\t")) != NULL; ) {
+            size_t tl = strlen(tok);
+            char *hit = dep_text;
+            if (!tl)
+                continue;
+            /* A whole token: at the start or after a tab, up to a tab. */
+            while ((hit = strstr(hit, tok)) != NULL
+                   && !((hit == dep_text || hit[-1] == '\t')
+                        && (hit[tl] == '\t' || hit[tl] == '\0')))
+                hit++;
+            if (!hit) {
+                free(dep_text);
+                dep_text = NULL;
+                break;
+            }
+        }
+        free(copy);
+    }
+    if (fname && dep_text && (f = fopen(fname, "a"))) {
+        fprintf(f, "%s %s\v%s\n", keyhex, entries, dep_text);
         fclose(f);
     }
     ret = entries_parse(sl, r, entries);
@@ -558,6 +695,9 @@ int dcc_mirror_search_list(char **argv, const char *input,
   out:
     if (ret)
         dcc_search_list_free(sl);
+    dcc_strset_free(&deps);
+    free(dep_text);
+    free(pre_text);
     free(probe);
     free(fname);
     free(line);

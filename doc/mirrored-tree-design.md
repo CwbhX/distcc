@@ -337,8 +337,15 @@ matches. Two checks cover this (`src/mirror_search.c`):
   user `late` and searches `early` first), missing directories and its
   implicit directories. A model of those rules got the duplicate case
   wrong, so none is kept. The answer is cached in `$DISTCC_DIR`, keyed by
-  the compiler binary's digest, the cwd, the probe, the environment and
-  which search directories exist. On the daemon the probe runs exactly
+  the compiler binary's digest, the cwd, the probe and the environment,
+  and each entry records what the order depends on: the identity (device
+  and inode, or absent) of every explicit and environment search
+  directory and of every directory the report lists or names as ignored
+  (missing or duplicate). An entry is used only while all of them are
+  unchanged, so a retargeted symlink (which changes the compiler's
+  duplicate elimination) or a compiler-provided directory that appears
+  later forces a new probe; an entry is not recorded if an explicit
+  directory changed while the compiler was being asked. On the daemon the probe runs exactly
   like the compile (confined to the job directory, with the overlay, other
   descriptors closed), since it runs the client's compiler command. Joined
   (`-isystemdir`), separate and `=` spellings are all recognized, and
@@ -535,6 +542,7 @@ right.
 | Shadowing: a synced search directory differs | `MirrorShadow_Case` |
 | Same size and mtime, other content (same-second edit) | `MirrorSameSecond_Case` |
 | Nested shadowing (`<sub/val.h>`, `early/sub` on both sides) with `-I`, joined `-isystem`, `CPATH`, and `-Ilate -Iearly -isystem late` (compiler's duplicate rule) | `MirrorNestedShadow_Case`, `MirrorJoinedShadow_Case`, `MirrorCpathShadow_Case`, `MirrorDedupOrderShadow_Case` |
+| The cached search path is not reused after a search directory is retargeted, or a compiler-provided one appears | `MirrorSearchCacheAlias_Case`, `MirrorSearchCacheImplicit_Case` |
 | The same duplicate on both sides is accepted | `MirrorDuplicateHarmless_Case` |
 | `-MF -` keeps dependencies on stdout (classic path) | `MirrorDepsStdout_Case` |
 | Unsupported search option (`-iprefix`) is not mirrored | `MirrorRefusedOption_Case` |

@@ -143,9 +143,11 @@ DSTA <len> <bytes>
     directory of a file read, that exists but was not read.  Both sides
     take the search path from the compiler: "<compiler> <the job's search
     and target flags> -x <lang> -E -v -" in the job's cwd and environment
-    (cached per compiler, cwd, flags, environment and which search
-    directories exist).  The server runs this probe confined like the
-    compile.
+    (cached per compiler, cwd, flags and environment, and reused only
+    while every directory the report depends on, listed or ignored as
+    missing or duplicate, and every explicit and environment search
+    directory, is still the same directory or still absent).  The server
+    runs this probe confined like the compile.
 
 client check
 ------------

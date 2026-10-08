@@ -2628,6 +2628,77 @@ class MirrorDedupOrderShadow_Case(MirrorShadowBase_Case):
         return "-Ilate -Iearly -isystem late"
 
 
+class MirrorSearchCache_Case(Mirror_Case):
+    """The cached search path must not outlive what it depends on.  A first
+    compile caches the compiler's search order; then the tree changes so
+    that the order changes and a file only this machine has (the daemon
+    hides it through test hooks) comes first.  The second compile must be
+    rejected, which needs a fresh search path."""
+    def headerSource(self):
+        return "\n"
+    def source(self):
+        return "#include <sub/val.h>\nint main(void) { return VAL - 1; }\n"
+    def createSource(self):
+        Compilation_Case.createSource(self)
+        self.make_tree()
+    def compileOpts(self):
+        return self.search_opts() + " -MD -MT testtmp.o -MF testtmp.d"
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_DOTD_FROM': self.new_path(),
+                'DISTCC_TESTING_MIRROR_DOTD_TO': self.old_path(),
+                'DISTCC_TESTING_MIRROR_OMIT': self.new_path()}
+    def runtest(self):
+        self.compile()
+        log = self.client_log()
+        self.assert_re_search("compiled in the mirror", log)
+        self.change_tree()
+        self.compile()
+        rest = self.client_log()[len(log):]
+        self.assert_re_search(self.new_path() + " exists only here", rest)
+        if re.search("compiled in the mirror", rest):
+            self.fail("stale search path accepted:\n" + rest)
+
+
+class MirrorSearchCacheAlias_Case(MirrorSearchCache_Case):
+    """-Ialias -Iearly -isystem late: while alias names late, the compiler
+    drops it (a user duplicate of a system directory); retargeted to mid,
+    it is searched first."""
+    def make_tree(self):
+        for d in ("early/sub", "late/sub", "mid/sub"):
+            os.makedirs(d)
+        open("early/sub/val.h", "w").write("#define VAL 1\n")
+        open("late/sub/val.h", "w").write("#define VAL 1\n")
+        os.symlink("late", "alias")
+    def change_tree(self):
+        os.remove("alias")
+        os.symlink("mid", "alias")
+        open("mid/sub/val.h", "w").write("#define VAL 2\n")
+    def search_opts(self):
+        return "-Ialias -Iearly -isystem late"
+    def new_path(self):
+        return "alias/sub/val.h"
+    def old_path(self):
+        return "early/sub/val.h"
+
+
+class MirrorSearchCacheImplicit_Case(MirrorSearchCache_Case):
+    """A compiler-provided directory that was missing appears: with
+    -isysroot fake, fake/usr/local/include comes before fake/usr/include."""
+    def make_tree(self):
+        os.makedirs("fake/usr/include/sub")
+        open("fake/usr/include/sub/val.h", "w").write("#define VAL 1\n")
+    def change_tree(self):
+        os.makedirs("fake/usr/local/include/sub")
+        open("fake/usr/local/include/sub/val.h", "w").write("#define VAL 2\n")
+    def search_opts(self):
+        # Absolute, so that the classic fallback works on the daemon too.
+        return "-isysroot " + _ShellSafe(os.path.abspath("fake"))
+    def new_path(self):
+        return os.path.abspath("fake/usr/local/include/sub/val.h")
+    def old_path(self):
+        return os.path.abspath("fake/usr/include/sub/val.h")
+
+
 class MirrorDuplicateHarmless_Case(MirrorShadowBase_Case):
     """The same early duplicate on both sides is not a shadow."""
     def daemon_env(self):
@@ -2905,6 +2976,8 @@ tests = [
          MirrorJoinedShadow_Case,
          MirrorCpathShadow_Case,
          MirrorDedupOrderShadow_Case,
+         MirrorSearchCacheAlias_Case,
+         MirrorSearchCacheImplicit_Case,
          MirrorDuplicateHarmless_Case,
          MirrorDepsStdout_Case,
          MirrorRefusedOption_Case,
