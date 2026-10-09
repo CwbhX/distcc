@@ -26,6 +26,7 @@
  *   h_mirror ident FILE         print the DSTA line for FILE
  *   h_mirror dsta LINE          parse a DSTA line and print it back
  *   h_mirror confine -          print "yes" if write confinement works
+ *   h_mirror trace-compiler CC  print "yes" if CC has a validated observer
  */
 
 #include <config.h>
@@ -53,7 +54,7 @@ int main(int argc, char *argv[])
     rs_add_logger(rs_logger_file, RS_LOG_DEBUG, NULL, STDERR_FILENO);
 
     if (argc != 3) {
-        fprintf(stderr, "usage: h_mirror sha256|digest|dotd|ident|dsta ARG\n");
+        fprintf(stderr, "usage: h_mirror sha256|digest|dotd|ident|dsta|confine|trace-compiler ARG\n");
         return 1;
     }
 
@@ -93,6 +94,12 @@ int main(int argc, char *argv[])
     } else if (strcmp(argv[1], "confine") == 0) {
         printf("%s\n", dcc_confine_available() && dcc_confine_probe() == 0
                ? "yes" : "no");
+    } else if (strcmp(argv[1], "trace-compiler") == 0) {
+        char *initial[] = { argv[2], NULL }, **copy;
+        if ((ret = dcc_copy_argv(initial, &copy, 0)))
+            return ret;
+        printf("%s\n", dcc_mirror_trace_compiler(&copy) == 0 ? "yes" : "no");
+        dcc_free_argv(copy);
     } else if (strcmp(argv[1], "dsta") == 0) {
         struct dcc_mirror_ident ident;
         char *copy = strdup(argv[2]), *path, *line;

@@ -54,6 +54,7 @@
 #include "trace.h"
 #include "exitcode.h"
 #include "mirror.h"
+#include "util.h"
 #include "mirror_search.h"
 
 /* ----- string sets ----- */
@@ -753,7 +754,7 @@ void dcc_strint_free(struct dcc_strint *m)
 }
 
 /* Set m[key] = max(m[key], val). */
-static int strint_max(struct dcc_strint *m, const char *key, int val)
+int dcc_strint_max(struct dcc_strint *m, const char *key, int val)
 {
     size_t i;
 
@@ -825,10 +826,10 @@ static int add_component_positions(struct dcc_strint *m, const char *path,
         size_t len = strlen(tok);
         if (!len)
             continue;
-        ret = strint_max(m, tok, pos);
+        ret = dcc_strint_max(m, tok, pos);
         if (!ret && len > 10 && strcmp(tok + len - 10, ".framework") == 0) {
             tok[len - 10] = '\0';
-            ret = strint_max(m, tok, pos);
+            ret = dcc_strint_max(m, tok, pos);
         }
     }
     free(copy);
@@ -967,6 +968,128 @@ int dcc_mirror_compiler_ident(const char *argv0,
     ret = dcc_mirror_digest(bin, &st, hex);
     free(bin);
     return ret;
+}
+
+/**
+ * Prepare the compiler for filesystem observation. Apple's /usr/bin tools
+ * strip DYLD_INSERT_LIBRARIES, so execute the selected real clang instead,
+ * preserving the shim's SDK and the original C/C++ driver mode.
+ *
+ * Interposition is only supported for compiler binaries whose filesystem
+ * imports and actual optional-header/PCH lookups have been checked. A
+ * matching version string is insufficient (wrappers can print anything).
+ * Additional compiler builds must pass the observer regressions and an
+ * import audit before adding their content digest here. Unknown builds use
+ * classic mode; never run an untrusted compiler outside confinement to ask
+ * whether it supports observation.
+ **/
+int dcc_mirror_trace_compiler(char ***argvp)
+{
+#ifdef __APPLE__
+    /* Apple clang 21.0.0 (clang-2100.3.34.2), arm64 CLT executable. */
+    static const char *const supported[] = {
+        "1590ac950a3d627817d09ade5cb60b2115f17a72182a3141e010b4bcc482a0c9",
+        NULL
+    };
+    char *found = path_lookup((*argvp)[0]), *compiler = NULL, **out = NULL;
+    char digest[DCC_SHA256_HEX_LEN + 1], *sdk = NULL;
+    const char *base, *sdk_env = getenv("SDKROOT");
+    int i, ret = EXIT_DISTCC_FAILED, known = 0, sysroot = 0, mode = 0;
+
+    if (!found || !(compiler = resolve_compiler((*argvp)[0])))
+        goto out;
+    base = strrchr(found, '/');
+    base = base ? base + 1 : found;
+    if (strcmp(base, "clang") && strcmp(base, "clang++")
+        && strcmp(base, "cc") && strcmp(base, "c++")
+        && strcmp(base, "gcc") && strcmp(base, "g++"))
+        goto out;
+    if (dcc_mirror_compiler_ident((*argvp)[0], digest))
+        goto out;
+    for (i = 0; supported[i]; i++)
+        if (strcmp(digest, supported[i]) == 0)
+            known = 1;
+    if (!known) {
+        rs_log_info("mirror: compiler %s has no validated filesystem observer", found);
+        goto out;
+    }
+    for (i = 1; (*argvp)[i]; i++) {
+        const char *a = (*argvp)[i];
+        if (str_startswith("-isysroot", a)
+            || strcmp(a, "--sysroot") == 0 || str_startswith("--sysroot=", a))
+            sysroot = 1;
+        if (str_startswith("--driver-mode=", a))
+            mode = 1;
+        /* These can satisfy lookups without reaching the real filesystem,
+         * or inject additional options after mirror's argument policy. */
+        if (str_startswith("-ivfsstatcache", a)
+            || str_startswith("-fdepscan", a)
+            || str_startswith("-fcas", a)
+            || str_startswith("-fcache-compile-job", a)
+            || str_startswith("--config", a))
+            goto out;
+    }
+    if (strncmp(found, "/usr/bin/", 9) == 0 && !sysroot
+        && !(sdk_env && *sdk_env)) {
+        const char *dev = getenv("DEVELOPER_DIR");
+        char selected[MAXPATHLEN + 1];
+        struct stat st;
+        if (!dev || !*dev) {
+            ssize_t n = readlink("/var/db/xcode_select_link", selected,
+                                 sizeof selected - 1);
+            if (n > 0) {
+                selected[n] = '\0';
+                dev = selected;
+            } else {
+                dev = "/Library/Developer/CommandLineTools";
+            }
+        }
+        if (asprintf(&sdk, "%s/SDKs/MacOSX.sdk", dev) < 0) {
+            sdk = NULL; ret = EXIT_OUT_OF_MEMORY; goto out;
+        }
+        if (stat(sdk, &st) || !S_ISDIR(st.st_mode)) {
+            free(sdk);
+            if (asprintf(&sdk, "%s/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+                         dev) < 0) {
+                sdk = NULL; ret = EXIT_OUT_OF_MEMORY; goto out;
+            }
+            if (stat(sdk, &st) || !S_ISDIR(st.st_mode))
+                goto out;
+        }
+    }
+    ret = dcc_copy_argv(*argvp, &out, 3);
+    if (ret)
+        goto out;
+    free(out[0]);
+    out[0] = compiler;
+    compiler = NULL;
+    if (!mode && strstr(base, "++")) {
+        char *arg = strdup("--driver-mode=g++");
+        if (!arg) { ret = EXIT_OUT_OF_MEMORY; goto out; }
+        dcc_argv_append(out, arg);
+    }
+    if (sdk) {
+        char *arg = strdup("-isysroot");
+        if (!arg) { ret = EXIT_OUT_OF_MEMORY; goto out; }
+        dcc_argv_append(out, arg);
+        dcc_argv_append(out, sdk);
+        sdk = NULL;
+    }
+    dcc_free_argv(*argvp);
+    *argvp = out;
+    out = NULL;
+    ret = 0;
+  out:
+    if (out)
+        dcc_free_argv(out);
+    free(compiler);
+    free(found);
+    free(sdk);
+    return ret;
+#else
+    (void) argvp;
+    return EXIT_DISTCC_FAILED;
+#endif
 }
 
 

@@ -30,9 +30,11 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -51,6 +53,7 @@
 #include "mirror_serve.h"
 #include "confine.h"
 #include "mirror_search.h"
+#include "mirror_trace.h"
 
 /* Options that write files or load code we do not track.  Refused even
  * though the confinement would stop the writes, so that the reason is clear
@@ -62,6 +65,11 @@ static const char *const refused_prefixes[] = {
     "-fcrash-diagnostics", "-emit-pch", "-MJ", "-fprofile", "-fdump",
     "-fplugin", "-load", "--analyze", "-fstack-usage", "-fsave-optimization-record",
     "-foptimization-record-file", "-fdiagnostics-format=sarif",
+    "-ivfsstatcache", "-fdepscan", "-fcas-", "-fcache-compile-job",
+    "-fno-integrated-cc1", "-fintegrated-cc1", "-ccc-", "-cc1",
+    "-fno-integrated-as", "-no-integrated-as", "-via-file-asm", "-Wp,",
+    "--offload", "--no-offload", "-foffload", "-fopenmp-target",
+    "-fsycl", "--cuda", "--hip", "-fcuda", "-fhip", "-fopenacc",
     NULL
 };
 
@@ -96,16 +104,28 @@ static int mirror_check_args(char **argv)
 
     for (i = 1; argv[i]; i++) {
         const char *a = argv[i];
+        if (strncmp(a, "-x", 2) == 0) {
+            const char *language = a[2] ? a + 2 : argv[i + 1];
+            const char *const allowed[] = {
+                "none", "c", "c++", "objective-c", "objective-c++",
+                "assembler-with-cpp", "cpp-output", "c++-cpp-output",
+                "objective-c-cpp-output", "objective-c++-cpp-output", NULL
+            };
+            int allowed_language = 0;
+            for (j = 0; language && allowed[j]; j++)
+                if (strcmp(language, allowed[j]) == 0)
+                    allowed_language = 1;
+            if (!allowed_language) {
+                rs_log_warning("mirror: refusing language %s",
+                               language ? language : "(missing)");
+                return EXIT_BAD_ARGUMENTS;
+            }
+        }
         for (j = 0; refused_prefixes[j]; j++) {
             if (str_startswith(refused_prefixes[j], a)) {
                 rs_log_warning("mirror: refusing argument %s", a);
                 return EXIT_BAD_ARGUMENTS;
             }
-        }
-        if (strcmp(a, "-x") == 0 && argv[i + 1]
-            && strstr(argv[i + 1], "-header")) {
-            rs_log_warning("mirror: refusing -x %s", argv[i + 1]);
-            return EXIT_BAD_ARGUMENTS;
         }
         if (strcmp(a, "-Xclang") == 0 || strcmp(a, "-Xpreprocessor") == 0) {
             const char *op = argv[i + 1];
@@ -322,6 +342,186 @@ static int probe_confined(void *vctx, char **argv, char **err_ret)
 static char *resolve_cb(const void *ctx, const char *path)
 {
     return opened_path((const struct dcc_mirror_rules *) ctx, path);
+}
+
+/* The trace is local, binary and bounded; DSTA carries only deduplicated
+ * query identities.  A lost record or an uninstrumented compiler never
+ * produces the completion marker required by the client. */
+static int dsta_append_queries(char **buf, size_t *len, size_t *cap,
+                               const char *trace, const char *job_dir,
+                               const char *input, pid_t compiler_pid,
+                               const struct dcc_mirror_rules *rules)
+{
+    struct traced_process { unsigned pid; int ended; } processes[64];
+    struct dcc_strset seen = { NULL, 0, 0 };
+    FILE *f = fopen(trace, "rb");
+    int n_processes = 0, i, ret = EXIT_DISTCC_FAILED, source_seen = 0;
+    unsigned records = 0, queries = 0;
+    char *source = dcc_mirror_normalize(rules, input);
+    size_t job_len = strlen(job_dir);
+    if (!f || !source)
+        goto out;
+    for (;;) {
+        struct dcc_mirror_trace_record record;
+        size_t nr = fread(&record, 1, sizeof record, f);
+        char *path = NULL, *logical = NULL, *key = NULL, *line = NULL;
+        unsigned kind, expected, nofollow;
+        char digest[DCC_SHA256_HEX_LEN + 1];
+        char alias[48];
+        unsigned long long device = 0, inode = 0;
+        if (!nr && feof(f))
+            break;
+        if (nr != sizeof record || ++records > 1000000
+            || record.magic != DCC_MIRROR_TRACE_MAGIC
+            || !record.pid || record.path_length > MAXPATHLEN)
+            goto out;
+        for (i = 0; i < n_processes; i++)
+            if (processes[i].pid == record.pid)
+                break;
+        if (record.type == DCC_MIRROR_TRACE_START) {
+            if (i != n_processes || n_processes == 64 || record.path_length
+                || record.mode || record.error)
+                goto out;
+            processes[n_processes].pid = record.pid;
+            processes[n_processes++].ended = 0;
+            continue;
+        }
+        if (i == n_processes || processes[i].ended)
+            goto out;
+        if (record.type == DCC_MIRROR_TRACE_END) {
+            if (record.path_length || record.mode || record.error)
+                goto out;
+            processes[i].ended = 1;
+            continue;
+        }
+        if ((record.type != DCC_MIRROR_TRACE_QUERY
+             && record.type != DCC_MIRROR_TRACE_LQUERY)
+            || !record.path_length
+            || (record.error && record.error != ENOENT
+                && record.error != ENOTDIR)
+            || (!record.error && !(record.mode & S_IFMT)))
+            goto out;
+        path = malloc((size_t) record.path_length + 1);
+        if (!path) { ret = EXIT_OUT_OF_MEMORY; goto out; }
+        if (fread(path, 1, record.path_length, f) != record.path_length) {
+            free(path);
+            goto out;
+        }
+        path[record.path_length] = '\0';
+        if (path[0] != '/' || memchr(path, '\0', record.path_length)
+            || strchr(path, '\n')) {
+            free(path);
+            goto out;
+        }
+        /* Output, overlay and trace files exist only in this helper job.
+         * They are artifacts introduced by distcc, never client inputs. */
+        if (strncmp(path, job_dir, job_len) == 0
+            && (path[job_len] == '/' || path[job_len] == '\0')) {
+            free(path);
+            continue;
+        }
+        nofollow = record.type == DCC_MIRROR_TRACE_LQUERY;
+        expected = record.error ? 0 : record.mode & S_IFMT;
+        /* An implicit driver configuration can add stat-cache, plugin or
+         * external-tool options after the normal argv policy. Unknown
+         * configurations therefore cannot authorize observed compilation. */
+        {
+            const char *suffix = strrchr(path, '.');
+            if (expected == S_IFREG && suffix && strcasecmp(suffix, ".cfg") == 0) {
+                free(path);
+                goto out;
+            }
+        }
+        if (testing_hook("DISTCC_TESTING_MIRROR_QUERY_MISSING", path)) {
+            /* A truthful missing lookup on a helper whose tree differs from
+             * this localhost test client's. */
+            kind = 0;
+            digest[0] = '\0';
+        } else if (testing_hook("DISTCC_TESTING_MIRROR_QUERY_DIRECTORY", path)) {
+            kind = S_IFDIR;
+            digest[0] = '\0';
+        } else if (dcc_mirror_query_ident(path, nofollow, &kind, digest,
+                                         &device, &inode)
+            || kind != expected) {
+            free(path);
+            goto out;
+        }
+        /* Replace physical map prefixes without collapsing symlink-sensitive
+         * '..' components in a syscall's actual spelling. */
+        logical = strdup(path);
+        for (i = 0; logical && i < rules->n_maps; i++) {
+            size_t plen = strlen(rules->map_phys[i]);
+            if (strncmp(path, rules->map_phys[i], plen) == 0
+                && (path[plen] == '/' || path[plen] == '\0')) {
+                free(logical);
+                logical = NULL;
+                if (asprintf(&logical, "%s%s", rules->map_logical[i],
+                             path + plen) < 0)
+                    logical = NULL;
+                break;
+            }
+        }
+        free(path);
+        if (!logical) { ret = EXIT_OUT_OF_MEMORY; goto out; }
+        if (kind == S_IFREG) {
+            char *norm = dcc_mirror_normalize(rules, logical);
+            if (norm && strcmp(norm, source) == 0)
+                source_seen = 1;
+            free(norm);
+        }
+        if (kind == S_IFREG)
+            snprintf(alias, sizeof alias, "%llu:%llu", device, inode);
+        else
+            strcpy(alias, "-");
+        if (kind == S_IFREG
+            && testing_hook("DISTCC_TESTING_MIRROR_QUERY_ALIAS", logical)) {
+            const char *other = getenv("DISTCC_TESTING_MIRROR_QUERY_ALIAS_WITH");
+            struct stat alias_stat;
+            if (!other || stat(other, &alias_stat)) {
+                free(logical);
+                goto out;
+            }
+            snprintf(alias, sizeof alias, "%llu:%llu",
+                     (unsigned long long) alias_stat.st_dev,
+                     (unsigned long long) alias_stat.st_ino);
+        }
+        if (asprintf(&key, "%u %s", nofollow, logical) < 0) {
+            free(logical); ret = EXIT_OUT_OF_MEMORY; goto out;
+        }
+        if (!dcc_strset_has(&seen, key)) {
+            if (asprintf(&line, "Q %u %u %s %s %s\n", nofollow, kind,
+                         alias, digest[0] ? digest : "-", logical) < 0) {
+                free(key); free(logical); ret = EXIT_OUT_OF_MEMORY; goto out;
+            }
+            ret = buf_append(buf, len, cap, line);
+            free(line);
+            if (!ret)
+                ret = dcc_strset_add(&seen, key);
+            queries++;
+        } else {
+            ret = 0;
+        }
+        free(key);
+        free(logical);
+        if (ret)
+            goto out;
+        ret = EXIT_DISTCC_FAILED;
+    }
+    for (i = 0; i < n_processes; i++)
+        if (!processes[i].ended)
+            goto out;
+    for (i = 0; i < n_processes; i++)
+        if (processes[i].pid == (unsigned) compiler_pid)
+            break;
+    if (i == n_processes || !source_seen || !queries || ferror(f))
+        goto out;
+    ret = buf_append(buf, len, cap, "T 1\n");
+  out:
+    if (f)
+        fclose(f);
+    free(source);
+    dcc_strset_free(&seen);
+    return ret;
 }
 
 /* Append a "C" line: a shadow candidate that exists here. */
@@ -567,6 +767,7 @@ int dcc_mirror_serve(int in_fd, int out_fd,
     char **env = NULL, **rule_strs = NULL, **saved_env = NULL;
     char *cver = NULL, *input_tmp, *output_tmp;
     char *job_dir = NULL, *obj_fname = NULL, *dotd_fname = NULL;
+    char *query_trace = NULL;
     char real[MAXPATHLEN + 1], why[MAXPATHLEN + 128];
     char my_cver[DCC_SHA256_HEX_LEN + 1];
     struct dcc_mirror_checklist checks = { NULL, 0, 0 };
@@ -688,17 +889,24 @@ int dcc_mirror_serve(int in_fd, int out_fd,
 
     if ((ret = apply_client_env(env, &saved_env)))
         goto out;
+    if (getenv("CCC_OVERRIDE_OPTIONS") && *getenv("CCC_OVERRIDE_OPTIONS"))
+        REFUSE(DCC_MIRR_ARG_POLICY, "compiler argument overrides prevent "
+               "complete filesystem query observation");
     if (dcc_mirror_compiler_ident(argv[0], my_cver) != 0
         || strcmp(my_cver, cver) != 0
         || getenv("DISTCC_TESTING_MIRROR_CVER"))
         REFUSE(DCC_MIRR_COMPILER, "compiler %s differs from the client's",
                argv[0]);
 
+    if (dcc_mirror_trace_compiler(&argv))
+        REFUSE(DCC_MIRR_ARG_POLICY, "compiler filesystem queries cannot be "
+               "observed by this helper");
+
     /* The include search path, as the client computes it (the compiler
      * may have been renamed by DISTCC_CMDLIST). */
-    free(client_argv[0]);
-    if (!(client_argv[0] = strdup(argv[0]))) {
-        ret = EXIT_OUT_OF_MEMORY;
+    dcc_free_argv(client_argv);
+    client_argv = NULL;
+    if ((ret = dcc_copy_argv(argv, &client_argv, 0))) {
         goto out;
     }
 
@@ -733,9 +941,29 @@ int dcc_mirror_serve(int in_fd, int out_fd,
     free(job_dir);
     if (!(job_dir = strdup(real))
         || asprintf(&obj_fname, "%s/out.o", job_dir) < 0
-        || asprintf(&dotd_fname, "%s/out.d", job_dir) < 0) {
+        || asprintf(&dotd_fname, "%s/out.d", job_dir) < 0
+        || asprintf(&query_trace, "%s/queries.trace", job_dir) < 0) {
         ret = EXIT_OUT_OF_MEMORY;
         goto out;
+    }
+
+    {
+        const char *library = getenv("DISTCC_MIRROR_TRACE_LIBRARY");
+        int trace_fd;
+        if (!library || !*library) {
+#ifdef DISTCC_MIRROR_TRACE_LIBRARY
+            library = DISTCC_MIRROR_TRACE_LIBRARY;
+#else
+            library = "";
+#endif
+        }
+        if (library[0] != '/' || access(library, R_OK) != 0
+            || getenv("DYLD_INSERT_LIBRARIES") || getenv(DCC_MIRROR_TRACE_ENV))
+            REFUSE(DCC_MIRR_ARG_POLICY, "compiler filesystem observer is "
+                   "unavailable or conflicts with the helper environment");
+        trace_fd = open(query_trace, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (trace_fd == -1) { ret = EXIT_IO_ERROR; goto out; }
+        close(trace_fd);
     }
     if ((ret = mirror_tweak_args(&argv, obj_fname, dotd_fname)))
         goto out;
@@ -793,8 +1021,20 @@ int dcc_mirror_serve(int in_fd, int out_fd,
         confine_failed = 1;
         ret = EXIT_DISTCC_FAILED;
     } else {
+        const char *library = getenv("DISTCC_MIRROR_TRACE_LIBRARY");
+        if (!library || !*library) {
+#ifdef DISTCC_MIRROR_TRACE_LIBRARY
+            library = DISTCC_MIRROR_TRACE_LIBRARY;
+#else
+            library = "";
+#endif
+        }
+        setenv("DYLD_INSERT_LIBRARIES", library, 1);
+        setenv(DCC_MIRROR_TRACE_ENV, query_trace, 1);
         ret = dcc_spawn_confined(argv, &pid, "/dev/null", out_fname,
                                  err_fname, job_dir, &confine_failed);
+        unsetenv("DYLD_INSERT_LIBRARIES");
+        unsetenv(DCC_MIRROR_TRACE_ENV);
     }
     if (saved_tmpdir)
         setenv("TMPDIR", saved_tmpdir, 1);
@@ -819,6 +1059,22 @@ int dcc_mirror_serve(int in_fd, int out_fd,
      * the include search. */
     if (!WIFSIGNALED(status) && WEXITSTATUS(status) == 0) {
         int n_files;
+        if (getenv("DISTCC_TESTING_MIRROR_TRACE_MISSING"))
+            unlink(query_trace);
+        if (getenv("DISTCC_TESTING_MIRROR_TRACE_TRUNCATE")) {
+            struct stat trace_stat;
+            int trace_fd = open(query_trace, O_WRONLY);
+            if (trace_fd >= 0) {
+                if (fstat(trace_fd, &trace_stat) == 0 && trace_stat.st_size > 0)
+                    (void) ftruncate(trace_fd, trace_stat.st_size - 1);
+                close(trace_fd);
+            }
+        }
+        if (!getenv("DISTCC_TESTING_MIRROR_DSTA_NO_TRACE")
+            && dsta_append_queries(&dsta, &dsta_len, &dsta_cap, query_trace,
+                                   job_dir, *input_ret, pid, &rules))
+            REFUSE(DCC_MIRR_ARG_POLICY, "compiler filesystem query trace is "
+                   "incomplete or changed during the compile");
         if ((ret = dcc_load_file_string(dotd_fname, &dotd_text))
             || (ret = testing_rewrite_dotd(&dotd_text))
             || (ret = dcc_mirror_parse_dotd(dotd_text, strlen(dotd_text),
@@ -910,6 +1166,7 @@ int dcc_mirror_serve(int in_fd, int out_fd,
     free(job_dir);
     free(obj_fname);
     free(dotd_fname);
+    free(query_trace);
     free(dotd_text);
     free(dsta);
     free(files);

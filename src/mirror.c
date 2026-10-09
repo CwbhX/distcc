@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "distcc.h"
 #include "trace.h"
@@ -214,6 +215,51 @@ int dcc_mirror_ident_equal(const struct dcc_mirror_ident *a,
         return a->digest[0] != '\0'
             && strcmp(a->digest, b->digest) == 0;
     return a->mtime == b->mtime;
+}
+
+/* Identity of a filesystem query, including paths which the compiler only
+ * tested with __has_include and therefore omitted from its dependency file.
+ * Directory queries compare existence/type, not their unrelated contents.
+ * For lstat/readlink, the symlink's spelling itself must match too. */
+int dcc_mirror_query_ident(const char *path, int nofollow,
+                           unsigned *kind, char digest[DCC_SHA256_HEX_LEN + 1],
+                           unsigned long long *device, unsigned long long *inode)
+{
+    struct stat st;
+    digest[0] = '\0';
+    *kind = 0;
+    *device = *inode = 0;
+    if ((nofollow ? lstat(path, &st) : stat(path, &st)) == -1) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return 0;
+        return EXIT_IO_ERROR;
+    }
+    *kind = st.st_mode & S_IFMT;
+    *device = (unsigned long long) st.st_dev;
+    *inode = (unsigned long long) st.st_ino;
+    /* Devices, FIFOs and sockets may provide content or state that cannot
+     * be proved by pathname/type equality. They use the classic path. */
+    if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode) && !S_ISLNK(st.st_mode))
+        return EXIT_DISTCC_FAILED;
+    if (S_ISREG(st.st_mode) && st.st_nlink > 1)
+        return EXIT_DISTCC_FAILED;
+    if (S_ISREG(st.st_mode))
+        return dcc_mirror_digest(path, &st, digest);
+    if (S_ISLNK(st.st_mode)) {
+        char target[MAXPATHLEN + 1];
+        ssize_t n = readlink(path, target, sizeof target);
+        struct dcc_sha256 ctx;
+        unsigned char hash[DCC_SHA256_LEN];
+        int i;
+        if (n < 0 || (size_t) n == sizeof target)
+            return EXIT_IO_ERROR;
+        dcc_sha256_init(&ctx);
+        dcc_sha256_update(&ctx, target, (size_t) n);
+        dcc_sha256_final(&ctx, hash);
+        for (i = 0; i < DCC_SHA256_LEN; i++)
+            sprintf(digest + 2 * i, "%02x", hash[i]);
+    }
+    return 0;
 }
 
 

@@ -153,7 +153,7 @@ Example:
 
 
 import time, sys, string, os, glob, re, socket
-import signal, os.path
+import signal, os.path, shutil
 import comfychair
 
 from stat import *                      # this is safe
@@ -2353,6 +2353,12 @@ class Mirror_Case(Compilation_Case):
         if out.strip() != "yes":
             raise comfychair.NotRunError(
                 "mirror mode needs write confinement, not available here")
+        if self.require_trace_compiler():
+            out, err = self.runcmd("h_mirror trace-compiler "
+                                   + _ShellSafe(self._cc_path()))
+            if out.strip() != "yes":
+                raise comfychair.NotRunError(
+                    "mirror query observation does not support this compiler")
         self.mirror_root = os.getcwd()
         f = open("cmdlist", "w")
         f.write(self._cc_path() + "\n")
@@ -2364,6 +2370,9 @@ class Mirror_Case(Compilation_Case):
         self.initCompiler()
         return os.path.realpath(self._cc) if os.path.islink(self._cc) \
             else self._cc
+
+    def require_trace_compiler(self):
+        return True
 
     def daemon_env(self):
         return {}
@@ -2377,6 +2386,14 @@ class Mirror_Case(Compilation_Case):
         # test compiler is allowed and no installed whitelist is needed.
         env = dict(self.daemon_env())
         env['DISTCC_CMDLIST'] = self.cmdlist
+        # The installed daemon uses its configured library path. For a
+        # build-tree daemon use the observer built beside that executable.
+        daemon = shutil.which('distccd')
+        if daemon:
+            observer = os.path.join(os.path.dirname(os.path.realpath(daemon)),
+                                    'distcc-mirror-trace.dylib')
+            if os.path.isfile(observer):
+                env.setdefault('DISTCC_MIRROR_TRACE_LIBRARY', observer)
         for k, v in env.items():
             saved[k] = os.environ.get(k)
             os.environ[k] = v
@@ -2480,6 +2497,168 @@ class MirrorStalePch_Case(MirrorRejected_Case):
         return {'DISTCC_TESTING_MIRROR_SKEW': 'pch.h.pch'}
     def expected_reason(self):
         return "pch.h.pch differs from the helper's copy"
+
+
+class MirrorOptionalHeader_Case(Mirror_Case):
+    """Optional probes synthesized by PCH macros remain mirrorable."""
+    def optional_name(self):
+        return "sub/optional.h"
+    def createSource(self):
+        Mirror_Case.createSource(self)
+        os.makedirs("inc/sub")
+        open("inc/" + self.optional_name(), "w").write("/* only probed */\n")
+        open("pch.h", "w").write(
+            '#define PCHTEXT ""\n'
+            '#define CAT(a,b) a ## b\n'
+            '#define OPTIONAL CAT(__has_, include)\n')
+        self.runcmd(self._cc + " -x c-header pch.h -o pch.h.pch")
+        open("inc/sub.h", "w").write(
+            '#if OPTIONAL(<%s>)\n#define SUBTEXT " optional"\n'
+            '#else\n#define SUBTEXT " absent"\n#endif\n'
+            % self.optional_name())
+    def checkBuiltProgramMsgs(self, msgs):
+        self.assert_equal(msgs, "hello mirror optional\n")
+
+
+class MirrorOptionalMissing_Case(MirrorOptionalHeader_Case,
+                                MirrorRejected_Case):
+    """Failed nested lookup is verified even though absent from the .d."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_QUERY_MISSING':
+                os.path.abspath("inc/" + self.optional_name())}
+    def expected_reason(self):
+        return "optional.h differs from the helper's copy"
+    def runtest(self):
+        MirrorRejected_Case.runtest(self)
+
+
+class MirrorOptionalAbsent_Case(MirrorOptionalHeader_Case):
+    """Matching failed nested probes are accepted without a tree walk."""
+    def createSource(self):
+        MirrorOptionalHeader_Case.createSource(self)
+        os.unlink("inc/" + self.optional_name())
+    def checkBuiltProgramMsgs(self, msgs):
+        self.assert_equal(msgs, "hello mirror absent\n")
+
+
+class MirrorOptionalSpliced_Case(MirrorOptionalHeader_Case):
+    """Clang records probes whose builtin spelling crosses a line splice."""
+    def createSource(self):
+        MirrorOptionalHeader_Case.createSource(self)
+        text = open("pch.h").read().replace(
+            "CAT(__has_, include)", "__has_inc\\\nlude")
+        open("pch.h", "w").write(text)
+        self.runcmd(self._cc + " -x c-header pch.h -o pch.h.pch")
+
+
+class MirrorOptionalFrozenPch_Case(Mirror_Case):
+    """A byte-identical PCH preserves optional decisions frozen at creation."""
+    def createSource(self):
+        Mirror_Case.createSource(self)
+        open("pch.h", "w").write(
+            '#if __has_include("frozen-optional.h")\n'
+            '#define PCHTEXT " optional"\n#else\n'
+            '#define PCHTEXT " absent"\n#endif\n')
+        self.runcmd(self._cc + " -x c-header pch.h -o pch.h.pch")
+        open("frozen-optional.h", "w").write("/* appeared after the PCH */\n")
+    def checkBuiltProgramMsgs(self, msgs):
+        self.assert_equal(msgs, "hello mirror absent\n")
+
+
+class MirrorOptionalDirectory_Case(MirrorOptionalMissing_Case):
+    """A directory on the helper cannot stand in for a local optional file."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_QUERY_DIRECTORY':
+                os.path.abspath("inc/" + self.optional_name())}
+
+
+class MirrorOptionalInstalled_Case(MirrorOptionalMissing_Case):
+    """Installed-directory relaxation cannot hide a failed optional probe."""
+    def optional_name(self):
+        return "optional.h"
+    def setupEnv(self):
+        MirrorOptionalMissing_Case.setupEnv(self)
+        os.environ['DISTCC_MIRROR_INSTALLED'] = (
+            os.path.abspath("inc") + ":/Library/Developer/CommandLineTools")
+
+
+class MirrorTraceMissing_Case(MirrorRejected_Case):
+    """No successful object is accepted without completed query coverage."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_TRACE_MISSING': '1'}
+    def expected_reason(self):
+        return "filesystem query trace is incomplete"
+
+
+class MirrorTraceTruncated_Case(MirrorTraceMissing_Case):
+    """A partial process completion record cannot authorize an object."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_TRACE_TRUNCATE': '1'}
+
+
+class MirrorTraceUnavailable_Case(MirrorRejected_Case):
+    """Missing instrumentation falls back before the helper compile."""
+    def daemon_env(self):
+        return {'DISTCC_MIRROR_TRACE_LIBRARY':
+                os.path.abspath("observer-does-not-exist.dylib")}
+    def expected_reason(self):
+        return "filesystem observer is unavailable"
+
+
+class MirrorLegacyHelper_Case(MirrorRejected_Case):
+    """An older helper's otherwise matching manifest cannot authorize output."""
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_DSTA_NO_TRACE': '1'}
+    def expected_reason(self):
+        return "did not provide complete filesystem queries"
+
+
+class MirrorAlias_Case(Mirror_Case):
+    """Matching symlink alias identities preserve #pragma once semantics."""
+    def createSource(self):
+        Mirror_Case.createSource(self)
+        open("inc/alias_a.h", "w").write(
+            '#pragma once\n#ifdef ALIAS_SEEN\n#undef ALIAS_TEXT\n'
+            '#define ALIAS_TEXT " twice"\n#else\n#define ALIAS_SEEN\n'
+            '#define ALIAS_TEXT " once"\n#endif\n')
+        os.symlink("alias_a.h", "inc/alias_b.h")
+        open("inc/sub.h", "w").write(
+            '#include <alias_a.h>\n#include <alias_b.h>\n'
+            '#define SUBTEXT ALIAS_TEXT\n')
+    def checkBuiltProgramMsgs(self, msgs):
+        self.assert_equal(msgs, "hello mirror once\n")
+
+
+class MirrorAliasMismatch_Case(MirrorAlias_Case, MirrorRejected_Case):
+    """Identical header bytes cannot hide differing file-alias topology."""
+    def createSource(self):
+        MirrorAlias_Case.createSource(self)
+        os.unlink("inc/alias_b.h")
+        shutil.copyfile("inc/alias_a.h", "inc/alias_b.h")
+    def daemon_env(self):
+        return {'DISTCC_TESTING_MIRROR_QUERY_ALIAS':
+                os.path.abspath("inc/alias_b.h"),
+                'DISTCC_TESTING_MIRROR_QUERY_ALIAS_WITH':
+                os.path.abspath("inc/alias_a.h")}
+    def expected_reason(self):
+        return "different file-alias topology"
+    def checkBuiltProgramMsgs(self, msgs):
+        self.assert_equal(msgs, "hello mirror twice\n")
+    def runtest(self):
+        MirrorRejected_Case.runtest(self)
+
+
+class MirrorOffloadRefused_Case(MirrorRejected_Case):
+    """Offload driver modes cannot introduce unvalidated compiler processes."""
+    def expected_reason(self):
+        return "an argument or the compiler was refused"
+    def compileOpts(self):
+        return (Mirror_Case.compileOpts(self)
+                + " -Wno-unused-command-line-argument " + self.offload_option)
+    def runtest(self):
+        for option in ("--offload-arch=sm_80", "--no-offload-arch=gfx900"):
+            self.offload_option = option
+            MirrorRejected_Case.runtest(self)
 
 
 class MirrorStaleHeader_Case(MirrorRejected_Case):
@@ -2831,12 +3010,18 @@ class MirrorBadPathmap_Case(MirrorRejected_Case):
         self.assert_re_search(self.expected_reason(), log)
 
 
-class MirrorConfined_Case(Mirror_Case):
-    """The compiler may only write in its job directory."""
+class MirrorWrapperRefused_Case(MirrorRejected_Case):
+    """An unsupported wrapper runs only through the classic path."""
+    def require_trace_compiler(self):
+        return False
+    def expected_reason(self):
+        return "compiler filesystem queries cannot be observed"
     def setup(self):
         Mirror_Case.setup(self)
     def _cc_path(self):
         self.initCompiler()
+        if self._cc.endswith("writecc"):
+            return self._cc
         real = os.path.realpath(self._cc)
         self.outside = [os.path.join(os.getcwd(), "written_in_mirror"),
                         os.getcwd() + "_written_outside"]
@@ -2855,10 +3040,11 @@ class MirrorConfined_Case(Mirror_Case):
                 "*-E\\ -v*) case \"$DISTCC_DIR\" in *daemon_distccdir*)\n")
         for path in self.probe_outside:
             f.write("  { echo x > '%s'; } 2>/dev/null\n" % path)
-        f.write("  ;; esac ;;\n*testtmp.c*)\n")
+        f.write("  ;; esac ;;\n*testtmp.c*) "
+                "case \"$DISTCC_DIR\" in *daemon_distccdir*)\n")
         for path in self.outside:
             f.write("  { echo x > '%s'; } 2>/dev/null\n" % path)
-        f.write("  ;; esac\nexec '%s' \"$@\"\n" % real)
+        f.write("  ;; esac ;; esac\nexec '%s' \"$@\"\n" % real)
         f.close()
         os.chmod(script, 0o755)
         self._cc = script
@@ -2873,11 +3059,11 @@ class MirrorConfined_Case(Mirror_Case):
         self.mirror_expect(self.client_log())
         for path in self.outside + self.probe_outside:
             if os.path.exists(path):
-                self.fail("confined compiler wrote %s" % path)
-        # The daemon did run its own probe.
-        if not os.path.exists(os.path.join(self.daemon_ddir,
+                self.fail("unsupported compiler wrote %s" % path)
+        # Refusal precedes any helper search probe or source compilation.
+        if os.path.exists(os.path.join(self.daemon_ddir,
                                            "mirror-searchpath")):
-            self.fail("the daemon did not probe the search path")
+            self.fail("the daemon probed an unsupported compiler")
     def daemon_env(self):
         # Its own DISTCC_DIR, so that it cannot use the client's cached
         # search path and has to run the probe.
@@ -2972,6 +3158,20 @@ tests = [
          MirrorHelper_Case,
          Mirror_Case,
          MirrorStalePch_Case,
+         MirrorOptionalHeader_Case,
+         MirrorOptionalMissing_Case,
+         MirrorOptionalAbsent_Case,
+         MirrorOptionalSpliced_Case,
+         MirrorOptionalFrozenPch_Case,
+         MirrorOptionalDirectory_Case,
+         MirrorOptionalInstalled_Case,
+         MirrorTraceMissing_Case,
+         MirrorTraceTruncated_Case,
+         MirrorTraceUnavailable_Case,
+         MirrorLegacyHelper_Case,
+         MirrorAlias_Case,
+         MirrorAliasMismatch_Case,
+         MirrorOffloadRefused_Case,
          MirrorStaleHeader_Case,
          MirrorOmittedFile_Case,
          MirrorOmittedDir_Case,
@@ -2995,7 +3195,7 @@ tests = [
          MirrorEnv_Case,
          MirrorPathmap_Case,
          MirrorBadPathmap_Case,
-         MirrorConfined_Case,
+         MirrorWrapperRefused_Case,
          MirrorStartRefused_Case,
          # slow tests below here
          Concurrent_Case,

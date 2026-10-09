@@ -520,7 +520,6 @@ static void pending_reset(struct pending_listing *pl)
     memset(pl, 0, sizeof *pl);
 }
 
-
 /**
  * Compare the daemon's description of what its compile read (DSTA) with
  * this machine.  It must describe every prerequisite of the returned .d
@@ -536,11 +535,13 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
                       char **first_mismatch)
 {
     char **dotd_paths = NULL, **files = NULL;
-    int n_dotd = 0, n_files, i, ret = 0;
+    int n_dotd = 0, n_files, i, ret = 0, traced = 0, n_queries = 0;
     struct dcc_strset file_set = { NULL, 0, 0 }, dir_set = { NULL, 0, 0 };
     struct dcc_strset comps = { NULL, 0, 0 };
     struct dcc_strset seen_files = { NULL, 0, 0 }, seen_dirs = { NULL, 0, 0 };
     struct dcc_strset shadows = { NULL, 0, 0 }, helper_shadows = { NULL, 0, 0 };
+    struct dcc_strint remote_aliases = { NULL, NULL, 0, 0 };
+    struct dcc_strint local_aliases = { NULL, NULL, 0, 0 };
     struct pending_listing pl;
     struct listing_ctx lctx;
     char *line, *next, *end = dsta + dsta_len;
@@ -603,6 +604,93 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
             if (!listing_acceptable(job, &pl, &lctx))
                 MISMATCH(pl.path);
             pending_reset(&pl);
+        }
+        if (strcmp(line, "T 1") == 0) {
+            if (traced++) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out;
+            }
+            continue;
+        }
+        if (line[0] == 'Q' && line[1] == ' ') {
+            unsigned nofollow, kind, here;
+            char digest[DCC_SHA256_HEX_LEN + 1], *p, *stop, *alias;
+            char local_alias[48];
+            unsigned long long device, inode;
+            unsigned long value;
+            p = line + 2;
+            errno = 0;
+            value = strtoul(p, &stop, 10);
+            if (errno || stop == p || *stop != ' ' || value > 1) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out;
+            }
+            nofollow = (unsigned) value;
+            p = stop + 1;
+            value = strtoul(p, &stop, 10);
+            if (errno || stop == p || *stop != ' ' || value > S_IFMT) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out;
+            }
+            kind = (unsigned) value;
+            p = stop + 1;
+            alias = p;
+            stop = strchr(p, ' ');
+            if (!stop || stop == p) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out;
+            }
+            *stop = '\0';
+            if (kind == S_IFREG) {
+                const char *colon = strchr(alias, ':');
+                if (!colon || colon == alias || !colon[1]
+                    || strlen(alias) > 42
+                    || strspn(alias, "0123456789:") != strlen(alias)
+                    || strchr(colon + 1, ':')) {
+                    ret = EXIT_PROTOCOL_ERROR;
+                    goto out;
+                }
+            } else if (strcmp(alias, "-") != 0) {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out;
+            }
+            p = stop + 1;
+            stop = strchr(p, ' ');
+            if (!stop || !stop[1] || stop[1] != '/') {
+                ret = EXIT_PROTOCOL_ERROR;
+                goto out;
+            }
+            *stop = '\0';
+            path = stop + 1;
+            if ((ret = dcc_mirror_query_ident(path, nofollow, &here, digest,
+                                             &device, &inode)))
+                goto out;
+            if (kind != here
+                || strcmp(p, digest[0] ? digest : "-") != 0)
+                MISMATCH(path);
+            if (kind == S_IFREG) {
+                int remote_group, local_group;
+                snprintf(local_alias, sizeof local_alias, "%llu:%llu",
+                         device, inode);
+                remote_group = dcc_strint_get(&remote_aliases, alias);
+                local_group = dcc_strint_get(&local_aliases, local_alias);
+                /* File IDs themselves differ across machines. Their
+                 * equivalence partition must match: #pragma once observes
+                 * that partition even when all header bytes are identical. */
+                if ((remote_group < 0) != (local_group < 0)
+                    || (remote_group >= 0 && remote_group != local_group)) {
+                    rs_log_info("mirror: %s has different file-alias topology", path);
+                    MISMATCH(path);
+                }
+                if (remote_group < 0) {
+                    int group = (int) remote_aliases.used + 1;
+                    if ((ret = dcc_strint_max(&remote_aliases, alias, group))
+                        || (ret = dcc_strint_max(&local_aliases, local_alias, group)))
+                        goto out;
+                }
+            }
+            n_queries++;
+            continue;
         }
         if (line[0] == 'C' && line[1] == ' ') {
             /* A shadow candidate the helper has: "C " + a file line. */
@@ -670,6 +758,14 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
             MISMATCH(pl.path);
         pending_reset(&pl);
     }
+    /* Older helpers and incomplete instrumentation cannot prove failed
+     * optional-header lookups.  Their objects must take the classic path. */
+    if (!traced || !n_queries) {
+        rs_log_warning("mirror: helper did not provide complete filesystem queries");
+        ret = EXIT_DISTCC_FAILED;
+        *first_mismatch = strdup("filesystem query trace");
+        goto out;
+    }
 
     for (k = 0; k < shadows.cap; k++) {
         const char *c = shadows.items[k];
@@ -704,6 +800,8 @@ int dcc_mirror_verify(struct dcc_mirror_job *job, char **argv,
   out:
     pending_reset(&pl);
     listing_ctx_free(&lctx);
+    dcc_strint_free(&remote_aliases);
+    dcc_strint_free(&local_aliases);
     free(files);
     dcc_mirror_free_paths(dotd_paths, n_dotd);
     dcc_strset_free(&file_set);

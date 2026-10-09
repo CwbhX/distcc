@@ -79,6 +79,9 @@ int dcc_mirror_ident_of(const char *path, int want_digest,
 int dcc_mirror_ident_equal(const struct dcc_mirror_ident *a,
                            const struct dcc_mirror_ident *b,
                            int compare_digest);
+int dcc_mirror_query_ident(const char *path, int nofollow,
+                           unsigned *kind, char digest[DCC_SHA256_HEX_LEN + 1],
+                           unsigned long long *device, unsigned long long *inode);
 
 int dcc_mirror_parse_dotd(const char *text, size_t len,
                           char ***paths_ret, int *n_ret);
@@ -148,6 +151,7 @@ struct dcc_strint {
 };
 void dcc_strint_free(struct dcc_strint *m);
 int dcc_strint_get(const struct dcc_strint *m, const char *key);
+int dcc_strint_max(struct dcc_strint *m, const char *key, int value);
 char *dcc_mirror_normalize(const struct dcc_mirror_rules *r, const char *path);
 int dcc_mirror_component_positions(char **files, int n_files,
                                    const struct dcc_search_list *sl,
@@ -159,6 +163,7 @@ int dcc_mirror_write_overlay(const struct dcc_mirror_rules *r,
                              char **roots, int n_roots, const char *fname);
 int dcc_mirror_compiler_ident(const char *argv0,
                               char hex[DCC_SHA256_HEX_LEN + 1]);
+int dcc_mirror_trace_compiler(char ***argvp);
 extern const char *const dcc_mirror_env_names[];
 
 #endif /* DISTCC_MIRROR_H */

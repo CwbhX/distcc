@@ -27,6 +27,14 @@ linux*)
 	;;
 esac
 
+# Mirror helpers trace compiler filesystem lookups through dyld interposition.
+# Other platforms retain classic/pump mode and do not build this library.
+MIRROR_TRACE_LIBRARY=
+case "${host_os}" in
+darwin*) MIRROR_TRACE_LIBRARY=distcc-mirror-trace.dylib ;;
+esac
+AC_SUBST(MIRROR_TRACE_LIBRARY)
+
 # FreeBSD installs its version of libpopt into /usr/local/, but does
 # not put that on the default library and header path.
 # Solaris doesn't even ship libpopt.  We used to add that path if
