@@ -15,8 +15,9 @@ protocol
 In protocol 4 the client sends no source.  The server (the "helper") has
 the client's tree at the same paths, compiles the source in place, and
 returns, besides the object, the dependency file and a description of
-every file and directory that took part in the compile (DSTA).  The client
-accepts the object only if all of them are identical on its side.
+the relevant files, directories and actual filesystem queries (DSTA).
+The client accepts the object only if they match according to the content,
+lookup, alias and directory rules below.
 
 The low level encoding (four-character tokens followed by eight hex
 digits, strings sent as a length and bytes) is the same as in protocols
@@ -24,7 +25,8 @@ digits, strings sent as a length and bytes) is the same as in protocols
 protocol; ",lzo" then only applies when a job falls back to protocol 1/2.
 
 A server that does not know version 4 rejects DIST 4 and closes the
-connection.
+connection. A version-4 helper without complete query records cannot
+authorize a successful result; the client retries that job in classic mode.
 
 request
 -------
@@ -67,7 +69,9 @@ ENVS <len> <bytes>
     DEVELOPER_DIR, MACOSX_DEPLOYMENT_TARGET, IPHONEOS_DEPLOYMENT_TARGET,
     CCC_OVERRIDE_OPTIONS, COMPILER_PATH, GCC_EXEC_PREFIX,
     SOURCE_DATE_EPOCH, ZERO_AR_DATE).  The server sets exactly these for
-    the compiler and unsets the others of the list.
+    the compiler and unsets the others of the list. A nonempty
+    CCC_OVERRIDE_OPTIONS is refused in mirror mode because it can introduce
+    unsupported options after argument validation.
 
 NRUL <n>
 RULE <len> <bytes>
@@ -90,13 +94,14 @@ DONE 4
 
 MIRR <code>
     0  the server compiled; the fields below follow.
-    Otherwise nothing was run, MIRM follows, and the connection ends:
+    Otherwise no result is accepted, MIRM follows, and the connection ends:
     1  mirror mode is off, or the cwd or input is not under a
        --mirror-root
     2  a synced file of the check list differs (pre-check)
     3  an argument or the compiler was refused, or the include search
        uses an option mirror mode does not model (-iprefix, -iwithprefix*,
-       -iwithsysroot, -I-, -ivfsoverlay, ...)
+       -iwithsysroot, -I-, -ivfsoverlay, ...), or complete compiler
+       filesystem-query observation was unavailable
     4  the cwd or the input is missing
     5  the compiler could not be confined to its job directory
     6  the server's compiler binary is not the client's
@@ -129,6 +134,10 @@ DSTA <len> <bytes>
                                            for a dangling symlink)
       A <path>                             absent
       O <path>                             neither file nor directory
+      Q <nofollow> <type> <alias|-> <sha256|-> <path> a filesystem query, including
+                                           successful optional-header tests
+                                           and failed lookup candidates
+      T 1                                  complete query-observation version 1
       C <size> <mtime> <sha256> <path>     a shadow candidate (below) that
                                            exists on the server
 
@@ -136,6 +145,22 @@ DSTA <len> <bytes>
     path (as files), and every directory of the include search path given
     by argv or the environment (CPATH, C_INCLUDE_PATH, ...), the directory
     of each of those files, and "." (as directories).
+
+    Q paths are absolute and preserve the actual syscall spelling (including
+    symlink-sensitive ".." components). nofollow is 0 for stat/open and 1
+    for lstat/readlink. type is decimal st_mode & S_IFMT, or 0 for a lookup
+    returning ENOENT/ENOTDIR. Regular files carry their content SHA-256 and
+    an opaque alias identifier (the helper's decimal device:inode pair);
+    other kinds use "-" for alias. The client requires a bijection between
+    helper alias groups and its own device:inode groups, preserving
+    #pragma once semantics even through directory symlinks. File identifiers
+    themselves need not have equal numeric values across hosts.
+    Symlinks queried without following carry the SHA-256 of their target
+    spelling; missing paths and other kinds carry "-". Directory Q records
+    compare existence/type, not a directory listing. The server deduplicates
+    queries and requires complete start/end records from every observed
+    compiler process, including the driver. Job-directory artifacts are
+    omitted. A successful result without T and Q records is refused.
 
     Shadow candidates: for each file read (except the input), spelled S
     relative to the search directory it lies in, every S in an earlier
@@ -163,6 +188,13 @@ directory may differ only in entries whose names are not a component of
 any path the compile read ("X.framework" also counts as "X"), since an
 include spelling is always a suffix of the path it resolved to.  Paths
 are stat()ed with symlinks followed, from the client's own cwd.
+
+Every Q record must also match on the client, with no installed-directory
+relaxation. This covers __has_include/__has_include_next and macro-generated
+queries that .d does not describe. The initial observer also refuses
+hardlinked regular query paths on both sides. Special-file queries and
+implicit driver configuration reads are also refused. An older helper
+without T 1 falls back.
 
 Only then are the object and the .d written next to their destinations and
 renamed into place.  Jobs whose dependency output does not go to a file

@@ -49,11 +49,11 @@ build directories behind symlinks), and `doctor` tells you what to fix.
 
 | Feature | What it does |
 |---|---|
-| **Mirrored-tree mode** (`,mirror`, protocol 4) | A helper that has a copy of the source tree at the same path compiles in that copy. The client sends no source and runs no preprocessor. It accepts the object only after it checks that every file and directory the compile used is identical on both machines. Precompiled headers (PCHs) work remotely. |
+| **Mirrored-tree mode** (`,mirror`, protocol 4) | A helper that has a copy of the source tree at the same path compiles in that copy. The client sends no source and runs no preprocessor. It checks file contents, directory identities, actual header lookups and header aliases before accepting the object. Precompiled headers (PCHs) work remotely. |
 | **`distcc-mirror`** | One command for the whole setup: install on both Macs, write a project config, run the helper daemon as a LaunchAgent, check that the machines match, sync, build, and test-compile against local results. |
 | **`distcc --mirror-sync`** | Copies the working tree to the mirror helpers with rsync. Uncommitted edits are included, and no git is involved. Build trees are filtered to sources, headers and PCHs. |
 | **Write confinement** | On the helper, each mirrored compile runs in a macOS Seatbelt sandbox. It can write only to its own job directory and has no network access. The daemon refuses to start in mirror mode if confinement doesn't work. |
-| **Safe fallback** | If a check fails, the helper refuses, or the compile fails in the mirror, the job is sent the classic way to the same helper. The helper is not marked bad, and the build never uses an object it can't trust. |
+| **Safe fallback** | If a check fails, the helper refuses, or the compile fails in the mirror, the mirror result is discarded and the job is sent the classic way to the same helper. The helper is not marked bad. |
 | **CMake PCHs in classic mode** | CMake's `-Xclang -include-pch` flags are no longer sent with preprocessed source, where they made every remote compile fail and back the helper off. No wrapper script is needed. |
 | **Faster slot scheduling** | When every slot is busy, a job now waits in the kernel on a busy slot instead of sleeping for a second and polling. A freed slot is used right away. |
 | **Separate preprocessor locks** | Local preprocessor slots (`--localslots_cpp`) have their own locks, so a job holding a remote slot isn't stuck waiting behind local compiles. |
@@ -73,11 +73,14 @@ mini (12 cores), joined by a Thunderbolt bridge.
 | This fork, classic mode, M6/14 + localhost/17 | 290 s | 1.63x |
 | **This fork, mirror mode, M6/14 + localhost/17** | **241 s** | **1.96x** |
 
-In mirror mode the pool runs at about the two machines' combined capacity:
+In that run the mirror pool ran at about the two machines' combined capacity:
 a mirrored job costs the host almost nothing. All objects were
 byte-identical to a local build, except one file that embeds the build time
 (that file was compiled locally). The full numbers and method are in
 [doc/mirrored-tree-design.md](doc/mirrored-tree-design.md#results-2026-10-07).
+
+These pool measurements predate filesystem-query tracing. The expanded
+verification has not yet been benchmarked across the two-machine pool.
 
 ## How the three modes work
 
@@ -91,6 +94,14 @@ Classic mode has the fewest requirements. Mirror mode is the fastest when
 both machines can be kept identical, which is easy for two Macs on one desk.
 A job that can't be mirrored (its cwd is outside the synced roots, it uses
 an unsupported option, or a file differs) falls back to classic mode.
+
+Mirror mode observes the compiler's actual header lookups, including failed
+`__has_include` checks, without adding local preprocessing. The observer
+currently supports the audited arm64 Apple clang 21.0.0
+(`clang-2100.3.34.2`) binary identified by SHA-256 in
+`src/mirror_ident.c`. Other compiler builds and wrappers use classic mode.
+Install the updated client, helper and tracing library together; an older
+helper without query records also falls back to classic mode.
 
 ## Installing
 
@@ -122,7 +133,8 @@ contrib/distcc-mirror install --helper m6
 
 This runs `autogen.sh` and `configure` if needed, builds with popt linked
 statically, and installs into `~/.local/distcc-mirror`. That includes
-`distcc`, `distccd`, the `distcc-mirror` tool and the compiler whitelist
+`distcc`, `distccd`, the `distcc-mirror` tool, the macOS
+`lib/distcc-mirror-trace.dylib` observer and the compiler whitelist
 the daemon requires. It then copies the install to each `--helper` over
 ssh. Run it again after pulling changes; once a project is set up, it
 copies to that project's helpers and restarts their daemons. Add
@@ -229,9 +241,11 @@ problem it finds:
 - ccache wired to distcc;
 - Homebrew formulae and `/opt/homebrew/include` the same on both.
 
-Mirror mode only accepts a remote object when every file the compile read
-is identical on both machines, so these matter. A mismatch is never a
-correctness problem, though: the jobs fall back and only speed suffers.
+Mirror mode checks file contents and filesystem lookups before accepting
+a remote object. A detected mismatch sends the job through classic distcc.
+The compiler also needs to be supported by the filesystem observer; matching
+version strings in `doctor` alone do not establish that. Use `test` to
+confirm that jobs actually compile in the mirror.
 
 **Homebrew:** `brew install` on the helper installs the newest versions,
 which may not match yours. Use this instead:
@@ -246,6 +260,8 @@ helper. Afterwards, upgrade both Macs together.
 
 **Compiler:** install the same Command Line Tools (or Xcode) version on
 both. Otherwise every job falls back with "compiler differs" (`MIRR 6`).
+Even matching compilers use classic mode if their binary is outside the
+observer's audited set (`MIRR 3`); see [How the three modes work](#how-the-three-modes-work).
 
 ## Building
 
@@ -274,6 +290,12 @@ distcc-mirror shell                 # a subshell with it
 For each file it shows whether it was mirrored, rejected or refused, and
 why. It also shows whether the object is byte-identical to a local
 compile. Nothing is written into the project.
+
+The command exits nonzero if any distcc compile fails, a local comparison
+compile fails, or an object differs. `--no-compare` skips the local compile
+and object comparison, but compilation failures still cause a nonzero exit.
+A successful classic fallback is reported and does not itself fail the
+command, so a zero exit status does not prove that every job was mirrored.
 
 ## distcc-mirror commands
 
@@ -375,7 +397,7 @@ cores on the helper (14 on 12 cores) and on the client (`localhost/17` on
 | `DISTCC_MIRROR_EXTRA` | More trees to sync whole, such as locally built dependency prefixes. |
 | `DISTCC_MIRROR_INSTALLED` | Installed trees, compared with a more tolerant rule for unrelated entries. Default `/Library/Developer/CommandLineTools:/Applications/Xcode.app:/opt/homebrew`. |
 | `DISTCC_MIRROR_SSH` | Sync destinations. The default is every `,mirror` host's address. |
-| `DISTCC_MIRROR_RSH` | ssh command for rsync (e.g. `ssh -p 2222`). |
+| `DISTCC_MIRROR_RSH` | Remote-shell command for both directory creation and rsync (e.g. `ssh -p 2222`). Defaults to `ssh`; uses rsync `-e` quoting rules without local shell expansion. |
 | `DISTCC_PAUSE_TIME_MSEC` | How long a job waits on one busy slot before it rescans the others (default 100 ms). It no longer needs tuning. |
 
 ### Daemon options
@@ -384,6 +406,12 @@ cores on the helper (14 on 12 cores) and on the client (`localhost/17` on
 |---|---|
 | `--mirror-root DIR` | Allow mirrored compiles whose cwd and input resolve under `DIR`. It can be repeated. Without it, mirror requests are refused and the jobs fall back. |
 | `--mirror-installed LIST` | Installed trees to use when a client sends no list. |
+
+### Daemon environment
+
+| Variable | Meaning |
+|---|---|
+| `DISTCC_MIRROR_TRACE_LIBRARY` | Absolute path to the macOS observer library. Defaults to the configured `libdir/distcc-mirror-trace.dylib`; useful for an uninstalled build. Set it in the daemon's environment; clients cannot override it. |
 
 ### Commands
 
@@ -408,16 +436,23 @@ cores on the helper (14 on 12 cores) and on the client (`localhost/17` on
   |---|---|---|
   | 1 | The cwd or input is not under a `--mirror-root` | Check `--mirror-root` and `DISTCC_MIRROR_ROOTS` |
   | 2 | A file on the check list differs | `distcc-mirror sync` (rebuild PCHs first; `distcc-mirror build` does both) |
-  | 3 | The argument or compiler is refused | The job uses an unsupported search option (`-iprefix`, `-ivfsoverlay`, ...) |
+  | 3 | The argument, compiler or filesystem observation is unsupported | Read the reason: an unsupported option/compiler, missing observer library or incomplete trace causes classic fallback |
   | 4 | The cwd or input is missing on the helper | Sync, or fix the path map |
   | 5 | Confinement failed on the helper | Check the daemon log |
   | 6 | The helper's compiler binary differs | Match the CLT/Xcode versions |
 
-- **Some jobs are rejected after compiling:** a header or a search directory
-  differs between the machines. Usually that's an installed library (such
-  as a Homebrew formula) at another version on the helper. The verbose log
-  and `distcc-mirror test` name the path; `distcc-mirror brew-parity` fixes
-  Homebrew differences.
+- **Observer unavailable or trace incomplete:** install this build on both
+  machines, including `lib/distcc-mirror-trace.dylib`, and restart the helper.
+  For an uninstalled helper, set `DISTCC_MIRROR_TRACE_LIBRARY` to the built
+  library's absolute path. Unsupported compiler builds, wrappers, offload
+  modes, implicit driver configs and unmodeled filesystem operations use
+  classic mode even when the observer is installed.
+- **Some jobs are rejected after compiling:** a file, include-search
+  directory, optional-header lookup or header alias differs between the
+  machines. A header that exists on only one machine can change
+  `__has_include` even if it is absent from the dependency file. The verbose
+  log and `distcc-mirror test` name the mismatch. Sync the source/build
+  trees; use `distcc-mirror brew-parity` for Homebrew differences.
 - **Caches:** `$DISTCC_DIR/mirror-digests` (file digests) and
   `$DISTCC_DIR/mirror-searchpath` (the compiler's search paths) can be
   deleted at any time.
@@ -427,14 +462,18 @@ cores on the helper (14 on 12 cores) and on the client (`localhost/17` on
 ```sh
 make check                                    # the whole suite
 make single-test TESTNAME=Mirror_Case         # one case (class names are in test/testdistcc.py)
+make mirror-tools-check                      # CLI, remote-shell and observer regressions
 ```
 
-The suite runs a daemon on localhost. It covers mirror mode with about 30
-cases: stale PCHs and headers, same-second edits, shadowing headers
-(including nested spellings, `CPATH` and duplicate search dirs), path
-mapping, compiler mismatch, confinement and the fallbacks. The cases that
-compile in the mirror need write confinement, so they run on macOS and are
-skipped elsewhere.
+The suite runs a daemon on localhost. It covers stale PCHs and headers,
+same-second edits, shadowing headers (including nested spellings, `CPATH`
+and duplicate search dirs), path
+mapping, optional-header probes and PCH macros, header aliases, missing or
+truncated traces, legacy helpers, compiler mismatch and the fallbacks.
+Cases that compile in the mirror require macOS write confinement and an
+audited compiler binary; they are skipped if either is unavailable. The
+observer tests are macOS-only. CLI exit-status and remote-shell tests run
+without a remote host and are also included in `make check`.
 
 ## Further documentation
 

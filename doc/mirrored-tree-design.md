@@ -153,7 +153,7 @@ Client environment (all optional except where noted):
 | `DISTCC_MIRROR_EXCLUDE` | Globs left out at the top of each root (e.g. `.git:build-release:output:tmp`), both by the sync and by directory identity. |
 | `DISTCC_MIRROR_EXTRA` | More trees to sync whole (Ohmly: the kicad-mac-builder dest dirs). |
 | `DISTCC_MIRROR_INSTALLED` | Installed-tree prefixes; default `/Library/Developer/CommandLineTools:/Applications/Xcode.app:/opt/homebrew`. Sent to the daemon, which uses the same list. |
-| `DISTCC_MIRROR_SSH`, `DISTCC_MIRROR_RSH` | Sync destinations (else every `,mirror` host's address) and the ssh command for rsync. |
+| `DISTCC_MIRROR_SSH`, `DISTCC_MIRROR_RSH` | Sync destinations (else every `,mirror` host's address) and the remote-shell command used for both directory creation and rsync. |
 
 Daemon options: `--mirror-root DIR` (repeatable; the cwd and the input must
 resolve under one) and `--mirror-installed LIST` (default when a client
@@ -203,19 +203,27 @@ stdout back until then.
    `-serialize-diagnostics`, `-fmodules*`, `-fcrash-diagnostics*`,
    `-emit-pch`, `-x *-header`, `-MJ`, `-fprofile*`, ...). `-Xclang` and
    `-Xpreprocessor` operands are allowlisted (`-include-pch`, `-include`,
-   `-imacros`), which also blocks `-Xclang -load`.
+   `-imacros`), which also blocks `-Xclang -load`. Only ordinary C, C++,
+   Objective-C, Objective-C++, assembler-with-cpp and their supported
+   preprocessed forms are accepted. Offload, external-assembler and
+   stat-cache/CAS options are refused.
 4. Apply the client's environment list, then compare the compiler binary's
-   SHA-256 with the client's (`MIRR 6`).
+   SHA-256 with the client's (`MIRR 6`). Require an audited compiler binary
+   for filesystem observation and no argument overrides (`MIRR 3`).
 5. Pre-check (`MIRR 2`): synced check-list files must have the client's
    size and mtime. This catches the common stale cases (source edited since
    the sync, PCH rebuilt and not synced) before any compile time is spent.
 6. Make a fresh job directory, point `-o` and `-MF` into it (an existing
    `-MF` is replaced; `-MD` is added, and `-MMD` becomes `-MD` so that
    system headers are listed and checked too), set `TMPDIR` to it, and run
-   the compiler there under write confinement (`MIRR 5` if that fails).
+   the compiler there under write confinement (`MIRR 5` if that fails),
+   with the observer library loaded and a private query trace file.
 7. While still in the cwd, describe every file of the `.d` and of the check
-   list and every directory that took part in the include search (see
-   Staleness), then answer. The job directory is removed recursively.
+   list and every directory that took part in the include search. For a
+   successful compile, require a complete trace and append the deduplicated
+   filesystem queries and file-alias identities (see Staleness). Missing
+   or unsupported observation refuses the result with `MIRR 3`. Then answer
+   and remove the job directory recursively.
 
 **Never write into the mirror: OS-enforced write confinement.** Outputs go
 to the per-job temp dir and are shipped back, so the host's build tree stays
@@ -277,10 +285,10 @@ changing underneath a job.
 `-include-pch` operand, every `-include` operand, and for each `-include H`
 the files the driver would load implicitly in its place (`H.pch`, `H.gch`),
 recorded as present or absent. A PCH that is absent on the host but present
-on the mirror is a mismatch like any other. If step 0 finds that any of the
-nine PCHs is chained to another PCH, the referenced PCH joins the list too.
+on the mirror is a mismatch like any other. PCHs opened by the compiler
+are also recorded by the filesystem observer.
 
-PCHs need this list because nothing else covers them. The `.d` does not
+PCHs need explicit checks because the `.d` does not
 list the `.pch`, and clang accepting a PCH says nothing about whether it is
 the host's current one: two PCHs built from the same, unchanged header that
 uses `__TIME__` differ in content and give different program output, yet
@@ -296,12 +304,12 @@ Two checks, in order:
   post-check. A handful of `stat`s; fails fast with `MIRR 2`. An
   optimisation, not the correctness check.
 - **Post-check** (client, `DSTA`): the identity of every file the compile
-  actually read according to the `.d`, **and of every check-list path**,
-  compared on the host before the object is accepted. This covers headers,
-  including generated ones, SDK and compiler builtin headers, and the PCHs.
-  It is the correctness check and is complete from step 1. A Command Line
-  Tools mismatch therefore shows up as a post-check failure, as well as a PCH
-  load error.
+  actually read according to the `.d`, **every check-list path**, and the
+  compiler's observed filesystem queries, compared on the host before the
+  object is accepted. This covers headers, including generated ones, SDK
+  and compiler builtin headers, PCHs, and optional lookup candidates absent
+  from the `.d`. Query checks include file-alias relationships as described
+  below. A Command Line Tools mismatch can also cause a PCH load error.
 
 **File identity** is size and SHA-256 of the content, for every file,
 `stat`ed with symlinks followed. Metadata is not enough anywhere: size-only
@@ -394,9 +402,44 @@ resolved through `DEVELOPER_DIR` or the xcode-select link); a mismatch is
 `DEVELOPER_DIR`, `MACOSX_DEPLOYMENT_TARGET`, `CCC_OVERRIDE_OPTIONS`, ...)
 are forwarded and set exactly for the compiler.
 
-The remaining blind spots: files read but not listed in the `.d`
-(`.incbin`, possibly `#embed`); and a symlink in an installed directory
-whose target appears or disappears without the directory itself changing.
+**Filesystem queries, including failed optional includes.** A dependency
+file does not record a failed `__has_include(<sub/optional.h>)`, or a
+successful probe whose header is never included. Shallow directory hashes
+and installed-tree relaxation cannot prove those decisions. The helper now
+observes actual filesystem queries during its single compile with the macOS
+`distcc-mirror-trace.dylib` observer. It records positive and negative
+lookups, including macros expanded from a PCH; the client checks every
+deduplicated query's type and the content of regular files before accepting
+the object. Missing candidates are checked directly, including nested
+directories and installed trees. Symlink queries also compare their target
+spellings. Regular-file query records also describe file-alias groups: the
+client requires their device/inode equivalence partition to match the
+helper's, so identical header bytes through a different symlink topology
+cannot change `#pragma once` decisions. This requires no source scan, local
+preprocessing, or recursive walk of include trees. Byte-identical PCHs
+preserve decisions already frozen when the PCH was created; queries
+performed by macros during the current compile are observed normally.
+
+Observation is deliberately limited to the audited Apple clang binary
+allowlisted by SHA-256 in `dcc_mirror_trace_compiler`. Other toolchains,
+compiler upgrades, wrappers, missing observer libraries, incomplete process
+traces, successful reads of driver `.cfg` files and unsupported filesystem
+operations take the classic path. The resolved toolchain compiler is invoked
+directly so `/usr/bin`'s protected shim cannot strip the observer; its C++
+driver mode and selected SDK are preserved. Stat-cache/CAS bypass options
+are refused. The initial observer also refuses hardlinked regular files.
+Special-file queries and directory enumeration are refused because their
+content or listing semantics are not represented by this manifest. The
+installed observer location is configured at build time; the daemon's
+absolute `DISTCC_MIRROR_TRACE_LIBRARY` can select another location for uninstalled
+builds. The query `Q` lines and mandatory `T 1` marker are documented in
+`protocol-4.txt`; results from older helpers without query coverage fall
+back instead of being accepted.
+
+This manifest checks observed lookup outcomes, regular-file content and
+file-alias relationships within the audited compiler capability contract.
+Arbitrary external tools and offload compiler modes are outside that
+contract and take the classic path.
 Jobs whose dependency output does not go to a file (`-MF -`,
 `DEPENDENCIES_OUTPUT`, `SUNPRO_DEPENDENCIES`) take the classic path.
 
@@ -425,7 +468,13 @@ ninja                                     # the build, with ,mirror active
 ```
 
 For each destination (arguments, `DISTCC_MIRROR_SSH`, or every `,mirror`
-host) it runs `ssh mkdir -p` for the roots, then `rsync -a -W --delete`:
+host) it creates the roots with the remote shell, then runs
+`rsync -a -W --delete`. Both steps use `DISTCC_MIRROR_RSH`, defaulting to
+`ssh`. The initial command tokenizes this setting using rsync `-e` rules:
+quotes group arguments, doubled quotes inside a quoted argument represent
+literal quotes, and local shell expansion is not performed. Remote paths
+are quoted separately so spaces and apostrophes survive directory creation.
+The sync copies:
 
 1. **Sources:** each `DISTCC_MIRROR_ROOTS` root, whole, except the
    `DISTCC_MIRROR_EXCLUDE` names at its top and any build tree inside it.
@@ -449,8 +498,8 @@ digest, so a version drift costs speed, not correctness.
 PCHs and generated headers are build outputs, so they have to exist before
 the sync; distcc cannot know a project's targets, which is why the first
 `ninja` line stays in the build script. If it is skipped, nothing breaks:
-jobs whose PCH is missing or old on the helper fail the check and compile
-locally. A later step could let the client push a missing or stale PCH
+jobs whose PCH is missing or old on the helper fail the check and use
+classic distcc. A later step could let the client push a missing or stale PCH
 itself when the daemon reports it (40–113 MB, 0.3–0.7 s), but that writes
 into the mirror during a build, so the daemon would also have to record
 each check-list file's inode before and after the compile and reject the
@@ -478,11 +527,17 @@ job if it changed.
   Tools.
 - **Sync forgotten or racing with edits.** The checks send the job to the
   classic path. Correct output, lost speed.
-- **Mirror silently diverges** in a file the compile reads but `.d` does not
-  list. The PCH is the known case and is covered by the check list, which
-  the post-check includes from step 1; `#embed`/`.incbin` data files are
-  another case and remain a residual risk, same class as ccache depend mode
-  itself.
+- **Inputs or lookup decisions absent from `.d`.** Check-list and observed
+  query records cover PCHs, failed optional includes and reads through the
+  audited filesystem APIs. Compiler support must be validated before a
+  binary is allowlisted; the manifest is not a general proof for arbitrary
+  toolchains or external tools. Missing or incomplete observation refuses
+  the mirror result.
+- **Observer unsupported or unavailable.** Even matching compiler binaries
+  need a validated observer implementation. Unsupported builds, missing
+  libraries, driver configs, offload modes and unsupported filesystem
+  operations cause `MIRR 3` and classic fallback. Install the client, helper
+  and observer library together, then restart the helper.
 - **Installed trees drift** (a `brew upgrade` or CLT update on one Mac):
   every job that reads a changed header fails the digest comparison and
   takes the classic path until the versions match again. Correct output,
@@ -491,7 +546,9 @@ job if it changed.
   platform without an equivalent): the daemon refuses to start with
   `--mirror-root`, or answers `MIRR 5` per job. Mirror jobs never run
   unconfined.
-- **Old daemon with `,mirror`**: connection fails, host backed off.
+- **Older helpers.** A daemon without protocol 4 rejects the connection and
+  the host is backed off. A protocol-4 helper without `Q`/`T` query coverage
+  has its object discarded and the job takes the classic path.
 - **Disk on the M6**: about 3.3 GB (2.0 GB mirror, the copied Homebrew kegs
   and kicad-mac-builder); it has 135 GB free.
 - **Spotlight on the helper** indexes the mirror after each sync. Excluding
@@ -517,9 +574,14 @@ job if it changed.
    way to the same host without marking it bad.
 3. **`distcc --mirror-sync`.** Done. Ohmly's `ohmly.sh` is not changed by
    this work; see Results for how the benchmark drove it.
-4. Later: an order-aware shadowing check for installed directories (to stop
-   the `fmt` false rejections), pushing a missing PCH on demand, a distccmon
-   phase for mirrored jobs.
+4. **Include-search validation.** Done: order-aware shadowing checks for
+   installed directories and search-path cache invalidation.
+5. **Compiler query observation.** Done: actual positive and negative
+   lookups, regular-file alias groups, complete process traces, compiler
+   capability gating and fallback. See `src/mirror_trace.c` and the query
+   handling in `src/mirror_serve.c` and `src/mirror_client.c`.
+6. Later: pushing a missing PCH on demand and a distccmon phase for mirrored
+   jobs.
 
 `src/lock.c` and `src/where.c` need no change for mirror mode; it simply
 never calls `dcc_lock_local_cpp`.
@@ -529,8 +591,9 @@ never calls `dcc_lock_local_cpp`.
 Each is a case in `test/testdistcc.py` (localhost; the daemon describes a
 file or directory differently through `DISTCC_TESTING_MIRROR_*` hooks, so
 staleness can be produced on one machine). The cases that compile in the
-mirror run only where write confinement is available (`h_mirror confine`,
-macOS today) and are skipped elsewhere, as on the Linux CI job; the helper
+mirror require write confinement (`h_mirror confine`, macOS today) and an
+audited compiler (`h_mirror trace-compiler CC`). They are skipped if either
+is unavailable, as on the Linux CI job; the helper
 and startup-refusal cases run everywhere. "Rejected" means the remote
 object is not used, the job goes the classic way, and the result is still
 right.
@@ -554,12 +617,51 @@ right.
 | cwd outside every root (`MIRR 1`) | `MirrorOutsideRoot_Case` |
 | Forwarded environment (`CPATH`) | `MirrorEnv_Case` |
 | Path map used / refused when it names another directory | `MirrorPathmap_Case`, `MirrorBadPathmap_Case` |
-| Compiler writes in the mirror and next to it are denied, for the compile and for the daemon's search-path probe | `MirrorConfined_Case` |
+| Unsupported compiler wrapper is refused before the helper's search probe or source compile, with no outside writes | `MirrorWrapperRefused_Case` |
+| Optional probes from PCH macros, failed nested probes and line-spliced builtin spellings remain mirrorable | `MirrorOptionalHeader_Case`, `MirrorOptionalAbsent_Case`, `MirrorOptionalSpliced_Case` |
+| Nested and installed optional-header state differs, including a directory instead of a file | `MirrorOptionalMissing_Case`, `MirrorOptionalInstalled_Case`, `MirrorOptionalDirectory_Case` |
+| Missing observer, missing/truncated process trace and older helper without query coverage fall back | `MirrorTraceUnavailable_Case`, `MirrorTraceMissing_Case`, `MirrorTraceTruncated_Case`, `MirrorLegacyHelper_Case` |
+| An identical PCH preserves an optional decision frozen before a header appeared | `MirrorOptionalFrozenPch_Case` |
+| Matching symlink alias topology is accepted; differing topology with identical header bytes is rejected | `MirrorAlias_Case`, `MirrorAliasMismatch_Case` |
+| Offload driver options use the classic path | `MirrorOffloadRefused_Case` |
 | `--mirror-root` refuses to start with `--enable-tcp-insecure` or a failing probe | `MirrorStartRefused_Case` |
 | SHA-256, `.d` escapes, DSTA parsing | `MirrorHelper_Case` |
 
-On the real pair: 40 Ohmly TUs compiled in the mirror gave objects and `.d`
-files byte-identical to local compiles; Results has the full set.
+Before filesystem-query tracing, 40 Ohmly TUs compiled on the real pair
+gave objects and `.d` files byte-identical to local compiles; Results has
+the historical measurements. The expanded checks still need a full
+two-machine project benchmark.
+
+### Filesystem-query validation (2026-10-08)
+
+On the development Mac with pump mode disabled, `make check` passed 102
+integration cases and 13 focused tests. Seven existing environment-specific
+cases were skipped (missing `/usr/include`, unavailable gdb, and an
+assembler-specific case). `make install-programs DESTDIR=...` also placed
+the observer in the configured library directory in a temporary staging tree.
+
+The focused tests are `test/test_distcc_mirror.py` (compile/comparison exit
+status), `test/test_mirror_sync_rsh.py` (transport selection and quoting,
+using fake remote commands), and `test/test_mirror_trace.py` (actual macOS
+filesystem calls, optional-header queries and PCHs). Run them together with
+`make mirror-tools-check`; `make check` includes this target.
+
+A loopback benchmark compared the final query-aware implementation with
+commit `370f1a6` using `/usr/bin/clang++`, its implicit SDK and two isolated
+daemons. One translation unit included `<cstdio>` and `<vector>` directly;
+the other loaded them from an ordinary C++ PCH. Each configuration ran eight
+times per workload, alternating order, discarding two warmups and reporting
+the median of the remaining six runs:
+
+| Workload | Baseline | Query-aware mirror | Change |
+|---|---:|---:|---:|
+| C++ headers | 209.27 ms | 206.57 ms | -1.3% (timing noise) |
+| C++ PCH | 88.14 ms | 90.97 ms | +3.2% |
+
+All 32 compilations were accepted in mirror mode and produced objects
+byte-identical to direct local compilation. These small, warm loopback
+measurements include verification but do not establish throughput for the
+full two-machine project build below.
 
 ## Results (2026-10-07)
 
