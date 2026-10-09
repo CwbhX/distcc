@@ -41,7 +41,7 @@
  * Hosts are the ssh destinations given as arguments, else
  * DISTCC_MIRROR_SSH (space-separated), else the address of every
  * ",mirror" host in the host list.  DISTCC_MIRROR_RSH replaces the ssh
- * command rsync uses. */
+ * command used for both directory creation and rsync. */
 
 #include <config.h>
 
@@ -151,6 +151,82 @@ static int rsync_base(struct argv_buf *a)
     return 0;
 }
 
+/* Tokenize like rsync's -e option: quotes group whitespace, and a
+ * doubled quote inside a quoted argument represents one literal quote.
+ * Do not invoke a local shell or expand shell metacharacters. */
+static int remote_shell(struct argv_buf *a)
+{
+    const char *rsh = getenv("DISTCC_MIRROR_RSH"), *p;
+    char *word;
+    int ret = 0;
+
+    if (!rsh || !*rsh)
+        return push(a, "ssh");
+    if (!(word = malloc(strlen(rsh) + 1)))
+        return EXIT_OUT_OF_MEMORY;
+    p = rsh;
+    while (*p && !ret) {
+        char quote = 0, *out = word;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
+        while (*p && (quote || (*p != ' ' && *p != '\t'))) {
+            if (*p == quote) {
+                if (p[1] == quote) {
+                    *out++ = *p;
+                    p += 2;
+                } else {
+                    quote = 0;
+                    p++;
+                }
+            } else if (!quote && (*p == '\'' || *p == '"')) {
+                quote = *p++;
+            } else {
+                *out++ = *p++;
+            }
+        }
+        if (quote) {
+            fprintf(stderr, "distcc --mirror-sync: unmatched quote in "
+                    "DISTCC_MIRROR_RSH\n");
+            ret = EXIT_BAD_ARGUMENTS;
+            break;
+        }
+        *out = 0;
+        ret = push(a, word);
+    }
+    free(word);
+    if (!ret && (!a->n || !*a->v[0]))
+        ret = EXIT_BAD_ARGUMENTS;
+    return ret;
+}
+
+/* ssh joins remote command arguments with spaces.  Quote each path for
+ * the remote shell, including any embedded single quotes. */
+static int push_remote_path(struct argv_buf *a, const char *path)
+{
+    char *quoted, *out;
+    const char *p;
+    int ret;
+    if (!(quoted = malloc(strlen(path) * 4 + 3)))
+        return EXIT_OUT_OF_MEMORY;
+    out = quoted;
+    *out++ = '\'';
+    for (p = path; *p; p++) {
+        if (*p == '\'') {
+            memcpy(out, "'\\''", 4);
+            out += 4;
+        } else {
+            *out++ = *p;
+        }
+    }
+    *out++ = '\'';
+    *out = 0;
+    ret = push(a, quoted);
+    free(quoted);
+    return ret;
+}
+
 static int is_under(const char *path, const char *root)
 {
     size_t len = strlen(root);
@@ -164,15 +240,15 @@ static int sync_one(const char *dest, const struct dcc_mirror_rules *r,
     int i, j, ret = 0;
 
     /* Create the parent directories first: rsync makes only the last. */
-    if ((ret = push(&a, "ssh")) || (ret = push(&a, dest))
+    if ((ret = remote_shell(&a)) || (ret = push(&a, dest))
         || (ret = push(&a, "mkdir")) || (ret = push(&a, "-p")))
         goto out;
     for (i = 0; i < r->n_roots && !ret; i++)
-        ret = push(&a, r->roots[i]);
+        ret = push_remote_path(&a, r->roots[i]);
     for (i = 0; i < r->n_build_roots && !ret; i++)
-        ret = push(&a, r->build_roots[i]);
+        ret = push_remote_path(&a, r->build_roots[i]);
     for (i = 0; i < n_extra && !ret; i++)
-        ret = push(&a, extra[i]);
+        ret = push_remote_path(&a, extra[i]);
     if (ret || (ret = run(a.v)))
         goto out;
     argv_free(&a);
