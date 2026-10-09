@@ -8,16 +8,15 @@
 # 2. Copies the working tree to the ',mirror' hosts: distcc --mirror-sync.
 # 3. Runs the build.
 #
-# Set up the environment first (see doc/mirrored-tree-design.md), e.g. for
-# a build dir reached through a symlink:
+# On the main Mac, configure its remote Mac over the Thunderbolt 4 bridge:
 #
-#   export DISTCC_HOSTS="172.31.250.2:3634/14,mirror localhost/17"
-#   export DISTCC_MIRROR_ROOTS="$HOME/Git/Ohmly"
-#   export DISTCC_MIRROR_EXCLUDE=".git:build-release:output:tmp"
-#   export DISTCC_MIRROR_PATHMAP="/Volumes/ExternalSSD/Developer/Ohmly/build-dev=$HOME/Git/Ohmly/build-dev"
-#   export DISTCC_MIRROR_EXTRA="$HOME/Github/kicad-mac-builder/build/wxwidgets-dest"
-#   export DISTCC_MIRROR_SSH=m6
-#   export CCACHE_PREFIX=distcc        # or a wrapper that runs distcc
+#   distcc-mirror init --helper remote-mac --build build
+#   eval "$(distcc-mirror env)"
+#   mirror-build.sh build
+#
+# remote-mac is any SSH name/address for the remote role. init detects each
+# Mac's cores and sets slot budgets. The final Ninja build uses their combined
+# slots (distcc -j) unless an explicit -j argument is supplied.
 #
 # Set DISTCC=/path/to/distcc if the right distcc is not first on PATH.
 
@@ -45,4 +44,12 @@ fi
 synced=$(date +%s)
 echo "mirror-build: PCHs and sync took $((synced - start))s" >&2
 
-ninja -C "$build" "$@"
+explicit_jobs=false
+for arg in "$@"; do
+  case "$arg" in -j|-j[0-9]*|--jobs|--jobs=*) explicit_jobs=true;; esac
+done
+if "$explicit_jobs"; then
+  ninja -C "$build" "$@"
+else
+  ninja -C "$build" -j "$("$distcc" -j)" "$@"
+fi

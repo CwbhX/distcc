@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the mirror CLI's compile/comparison exit status."""
+"""Regression tests for mirror CLI failures, capacity detection and builds."""
 
 import contextlib
 import io
@@ -7,9 +7,13 @@ import os
 from pathlib import Path
 import runpy
 import subprocess
+import tempfile
 import types
 import unittest
 from unittest import mock
+
+
+TOOL = Path(__file__).resolve().parents[1] / "contrib" / "distcc-mirror"
 
 
 class MirrorTestStatus(unittest.TestCase):
@@ -107,6 +111,158 @@ class MirrorTestStatus(unittest.TestCase):
             [((0, "compiled in the mirror on helper", b"object"), None)],
             no_compare=True)
         self.assertEqual(status, 0)
+
+
+class MirrorCapacity(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="distcc-capacity-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        (self.root / "build").mkdir()
+        self.path = self.root / "project.conf"
+        self.namespace = runpy.run_path(str(TOOL))
+        self.command = self.namespace["cmd_init"]
+        self.globals = self.command.__globals__
+
+    def init(self, main_cores=8, remote_cores="20", local_jobs=None,
+             helper="render-node", client_addr=""):
+        args = types.SimpleNamespace(
+            root=str(self.root), build="build", name="project", force=True,
+            helper=[helper], port=None, local_jobs=local_jobs,
+            client_addr=client_addr, exclude=[], extra=[], prefix=None, set=[])
+        reply = "ncpu=%s\nclient=198.51.100.1\n" % remote_cores
+        response = subprocess.CompletedProcess([], 0, reply, "")
+        output = io.StringIO()
+        with mock.patch.dict(self.globals,
+                             config_path_for=lambda _: str(self.path),
+                             ssh_hostname=lambda _: "198.51.100.2",
+                             cmake_launcher=lambda _: None), \
+                mock.patch.object(os, "cpu_count", return_value=main_cores), \
+                mock.patch.dict(self.globals, remote=mock.Mock(
+                    return_value=response)), \
+                contextlib.redirect_stdout(output), \
+                contextlib.redirect_stderr(output):
+            remote = self.globals["remote"]
+            try:
+                self.command(args)
+                status = 0
+            except SystemExit as exc:
+                status = exc.code
+        return status, output.getvalue(), remote
+
+    def test_unequal_machines_detect_independent_budgets(self):
+        for main, remote in ((8, 20), (20, 4), (1, 1)):
+            with self.subTest(main=main, remote=remote):
+                status, output, probe = self.init(main, str(remote))
+                self.assertEqual(status, 0, output)
+                config = self.namespace["Config"](str(self.path))
+                self.assertEqual(config.local_jobs, main + 2)
+                self.assertEqual(config.helpers[0].jobs, remote + 2)
+                self.assertEqual(config.total_jobs(), main + remote + 4)
+                self.assertEqual(config.env()["DISTCC_HOSTS"],
+                                 "198.51.100.2:3634/%d,mirror localhost/%d"
+                                 % (remote + 2, main + 2))
+                self.assertIn("main Mac: %d slots" % (main + 2), output)
+                self.assertIn("remote Mac render-node", output)
+                self.assertIn("combined build budget: %d jobs"
+                              % (main + remote + 4), output)
+                self.assertEqual(probe.call_args.args[1], "render-node")
+
+    def test_explicit_slot_overrides_need_no_core_detection(self):
+        status, output, probe = self.init(
+            main_cores=None, remote_cores="", local_jobs=5,
+            helper="other-computer=198.51.100.2/7",
+            client_addr="198.51.100.1")
+        self.assertEqual(status, 0, output)
+        probe.assert_not_called()
+        config = self.namespace["Config"](str(self.path))
+        self.assertEqual(config.total_jobs(), 12)
+        self.assertIn("manual override", output)
+
+    def test_missing_or_invalid_remote_cores_are_not_guessed(self):
+        for cores in ("", "unavailable", "0", "-1"):
+            with self.subTest(cores=cores):
+                status, output, _ = self.init(remote_cores=cores)
+                self.assertEqual(status, 1)
+                self.assertIn("cannot detect the core count for remote Mac", output)
+                self.assertFalse(self.path.exists())
+
+    def test_missing_main_cores_are_not_guessed(self):
+        status, output, probe = self.init(main_cores=None)
+        self.assertEqual(status, 1)
+        self.assertIn("cannot detect the main machine's core count", output)
+        probe.assert_not_called()
+        self.assertFalse(self.path.exists())
+
+    def test_zero_slot_overrides_are_rejected(self):
+        for args in ({"local_jobs": 0}, {"helper": "render-node/0"}):
+            with self.subTest(args=args):
+                status, output, _ = self.init(**args)
+                self.assertEqual(status, 1)
+                self.assertIn("positive compile slot count", output)
+                self.assertFalse(self.path.exists())
+
+    def test_handwritten_config_detects_slots_with_its_ssh_transport(self):
+        self.path.write_text("ROOTS=%s\nBUILD_DIR=%s\nHELPERS=render-node\n"
+                             "RSH='ssh -p 2222'\n" %
+                             (self.root, self.root / "build"))
+        response = subprocess.CompletedProcess([], 0, "ncpu=10\n", "")
+        with mock.patch.object(os, "cpu_count", return_value=6), \
+                mock.patch.dict(self.globals,
+                                ssh_hostname=lambda _: "198.51.100.2"), \
+                mock.patch.dict(self.globals, remote=mock.Mock(
+                    return_value=response)):
+            config = self.namespace["Config"](str(self.path))
+            self.assertEqual(config.total_jobs(), 20)
+            probe = self.globals["remote"]
+            self.assertEqual(probe.call_args.args[:2],
+                             ("ssh -p 2222", "render-node"))
+
+    def test_build_uses_combined_capacity_and_respects_override(self):
+        (self.root / "build" / "build.ninja").touch()
+        config = types.SimpleNamespace(
+            build_dir=str(self.root / "build"), full_env=lambda: {},
+            total_jobs=lambda: 34)
+        command = self.namespace["cmd_build"]
+        for extra, expected in (([], ["-j34"]),
+                                (["-j7", "target"], ["-j7", "target"])):
+            with self.subTest(extra=extra):
+                args = types.SimpleNamespace(build_dir=None, ninja_args=extra,
+                                             no_pch=True, no_sync=True)
+                with mock.patch.dict(self.globals, load_config=lambda _: config), \
+                        mock.patch.object(subprocess, "run", return_value=
+                                          subprocess.CompletedProcess([], 0)) as run, \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exit_:
+                        command(args)
+                self.assertEqual(exit_.exception.code, 0)
+                self.assertEqual(run.call_args.args[0],
+                                 ["ninja", "-C", config.build_dir] + expected)
+
+
+class MirrorBuildScript(unittest.TestCase):
+    def test_combined_distcc_slots_and_manual_override(self):
+        with tempfile.TemporaryDirectory(prefix="distcc-budget-") as directory:
+            root = Path(directory)
+            log = root / "ninja.log"
+            ninja = root / "ninja"
+            ninja.write_text("#!/bin/sh\ncase \"$*\" in *'-t targets all'*) "
+                             "exit 0;; esac\nprintf '%s\\n' \"$*\" "
+                             "> \"$NINJA_TEST_LOG\"\n")
+            ninja.chmod(0o755)
+            distcc = root / "distcc"
+            distcc.write_text("#!/bin/sh\ncase \"$1\" in -j) echo 34;; "
+                              "--mirror-sync) exit 0;; *) exit 1;; esac\n")
+            distcc.chmod(0o755)
+            script = TOOL.parent / "mirror-build.sh"
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                       DISTCC=str(distcc), NINJA_TEST_LOG=str(log))
+            for flags, expected in (([], "-C build -j 34"),
+                                    (["-j7", "target"], "-C build -j7 target")):
+                result = subprocess.run(["/bin/bash", str(script), "build"] + flags,
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(log.read_text().strip(), expected)
 
 
 if __name__ == "__main__":

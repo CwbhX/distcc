@@ -1,9 +1,12 @@
 # Design: mirrored-tree mode
 
-Status: implemented on the `mac-pool-perf` branch, 2026-10-07 (steps 1-3 of
-the plan below, plus the fixes from a design audit); results are in
-"Results". The wire format is in `doc/protocol-4.txt`. It follows on from
-`doc/perf-findings-two-mac-pool.md` (same two Macs, same Ohmly workload).
+Status: implemented on this fork's `master` branch, including query
+verification and setup-capacity detection. The wire format is in
+`doc/protocol-4.txt`. The target topology is a main Mac and a remote Mac
+connected through a Thunderbolt 4 network bridge. Mac model names, SSH
+aliases, addresses and fixed core counts below identify historical test
+fixtures; they are not requirements or defaults for another installation.
+For the current setup guide, see [README.md](../README.md).
 
 ## The idea
 
@@ -21,6 +24,38 @@ What it removes per remote job: host cpp time and the local cpp lock, the
 helper slot sitting idle while the host preprocesses, the `.ii` transfer, and
 the missing-PCH penalty on the helper. What it adds: a sync step
 (`distcc --mirror-sync`), and a way to prove the mirror was current.
+
+## Target setup and machine roles
+
+The **main Mac** owns the source/build tree and runs the build tool (the
+client/host role in distcc). The **remote Mac** runs `distccd` and compiles
+its synchronized copy (the helper role). Either supported Mac can take
+either role, independently of its chip model and core count.
+
+Connect the Macs with Thunderbolt 4, enable the Thunderbolt Bridge network,
+and enable SSH on the remote Mac. Point an SSH alias such as `remote-mac`
+at its bridge address so compilation and synchronization use that link.
+On the main Mac, from the project directory:
+
+```sh
+distcc-mirror init --helper remote-mac --build build
+distcc-mirror helper install
+distcc-mirror doctor
+distcc-mirror build
+```
+
+`init` queries logical cores on the main Mac and over SSH on the remote,
+then assigns each its detected core count + 2 compile slots. `build` uses
+their sum as its default Ninja/Make job count. Slot overrides are optional
+(`--local-jobs N`, `--helper remote-mac/SLOTS`); an explicit build `-j`
+argument wins. No model names select slot budgets, and failed detection
+requires a supplied count instead of assuming a particular machine.
+The generated config records these values; rerun `init --force` when
+changing machines. Hand-written configs that omit slot counts detect them
+when loaded, using the configured SSH transport for the remote.
+
+The compiler-version/content checks, supported observer binary and PCH
+compatibility requirements still apply to both Macs, as described below.
 
 ## Part A: what the PCH is worth on Ohmly (measured on the host)
 
@@ -72,7 +107,7 @@ Not measured: anything on the helper. The M6 has no Ohmly tree, and this investi
 did not create files there. All gains below assume the helper's
 PCH/non-PCH ratio matches the host's.
 
-## Facts about the environment that shape the design
+## Historical benchmark environment
 
 - **Compilers must match.** Clang refuses a PCH written by a different
   compiler build. On 2026-10-06 the host had clang-2100.3.33.1 and the M6
@@ -133,7 +168,7 @@ PCH/non-PCH ratio matches the host's.
 
 ## Host-list syntax and configuration
 
-`172.31.250.2:3634/12,mirror`
+`remote-mac:3634/N,mirror` (N is the detected remote slot budget)
 
 - `,mirror` sets `host->cpp_where = DCC_CPP_MIRROR` and `protover =
   DCC_VER_4` (`src/hosts.c`). `,mirror` with `,cpp` is a hostspec error.
@@ -151,7 +186,7 @@ Client environment (all optional except where noted):
 | `DISTCC_MIRROR_PATHMAP` | `physical=logical` prefix pairs, colon-separated. The physical cwd is sent under its logical name, after checking that both are the same directory (device and inode); otherwise the job takes the classic path. `$PWD` is not used: it is wrong whenever ninja runs with `-C`. The logical sides are also the build trees. |
 | `DISTCC_MIRROR_ROOTS` | Synced source roots. Jobs whose (mapped) cwd is outside them take the classic path. Also what `--mirror-sync` copies. |
 | `DISTCC_MIRROR_EXCLUDE` | Globs left out at the top of each root (e.g. `.git:build-release:output:tmp`), both by the sync and by directory identity. |
-| `DISTCC_MIRROR_EXTRA` | More trees to sync whole (Ohmly: the kicad-mac-builder dest dirs). |
+| `DISTCC_MIRROR_EXTRA` | More trees to sync whole, such as locally built dependency prefixes. |
 | `DISTCC_MIRROR_INSTALLED` | Installed-tree prefixes; default `/Library/Developer/CommandLineTools:/Applications/Xcode.app:/opt/homebrew`. Sent to the daemon, which uses the same list. |
 | `DISTCC_MIRROR_SSH`, `DISTCC_MIRROR_RSH` | Sync destinations (else every `,mirror` host's address) and the remote-shell command used for both directory creation and rsync. |
 
@@ -261,7 +296,8 @@ compiler read any file the daemon user can read, and error messages can echo
 its content back. Writes are confined to the per-job temp dir by the
 OS-enforced confinement above, which is part of the first shippable step
 rather than optional hardening. The read side is acceptable here: same user
-on both machines, a point-to-point link, and `--allow 172.31.250.1/32`.
+on both machines, a point-to-point link, and an `--allow` rule for the main
+Mac's Thunderbolt Bridge address.
 Mirror mode must be off unless `--mirror-root` is given, and should refuse to
 start alongside `--enable-tcp-insecure`.
 
@@ -315,7 +351,7 @@ Two checks, in order:
 `stat`ed with symlinks followed. Metadata is not enough anywhere: size-only
 misses a same-length edit (one changed digit in a constant), and size plus
 whole-second mtime misses the same edit made within the second (openrsync
-also drops the nanoseconds on the M6, and installed trees need not share
+also dropped nanoseconds in the historical tests, and installed trees need not share
 mtimes at all; see Facts). A review reproduced exactly that: local result
 1, helper result 2, accepted. A wrong object would be cached by ccache
 under the host's key.
@@ -389,7 +425,8 @@ While the M6 lacked Homebrew's `fmt`, 19 Ohmly TUs (0.5%) failed the
 candidate check: Ohmly's own `fmt` is found first, but `/opt/homebrew/include`
 is also the directory of headers those TUs read, so a `"fmt/base.h"` from
 one of them would find Homebrew's copy on the host. After the host's
-remaining Homebrew kegs were copied to the M6 (see the M6 setup appendix),
+remaining Homebrew kegs were copied to the M6 (see the historical remote
+Mac setup appendix),
 those TUs compile in the mirror, byte-identical to local compiles.
 
 **Compiler identity and environment.** The `.d` does not list the
@@ -491,9 +528,10 @@ which costs more than sending a changed PCH over this link. The first sync
 of Ohmly took 11.2 s (2.0 GB, of which 675 MB build tree); see Results for
 a re-sync.
 
-Homebrew kegs and the CLT are not synced: they are installed on the M6 at
-the host's versions (exact kegs copied and pinned, see Facts) and checked by
-digest, so a version drift costs speed, not correctness.
+Homebrew kegs and the CLT are not synced by the project sync command.
+Install matching versions on both Macs and compare their digests; a detected
+version drift sends jobs through classic distcc. The historical environment
+section records how the test pair was matched.
 
 PCHs and generated headers are build outputs, so they have to exist before
 the sync; distcc cannot know a project's targets, which is why the first
@@ -510,13 +548,13 @@ job if it changed.
 - ccache stays in front. `CCACHE_PREFIX` runs distcc only on a miss, and in
   depend mode ccache reads the `.d` that mirror mode returns. Because cwd and
   paths are identical, `base_dir`-relative arguments resolve the same way on
-  the M6.
+  the remote Mac.
 - The `-Xpreprocessor` PCH rewrite in `distcc-clang.sh` becomes unnecessary
   for mirrored jobs but is harmless: measured above, the rewritten spelling
   still loads the PCH when compiling from source. Fallback jobs that take
   the `.ii` path no longer need it either: distcc now strips CMake's
-  `-Xclang` PCH pairs from the remote command itself (see Using it with
-  Ohmly). `-emit-pch` already bypasses distcc.
+  `-Xclang` PCH pairs from the remote command itself (see the historical
+  Ohmly configuration appendix). `-emit-pch` already bypasses distcc.
 - The wrapper's `-target` insertion is unaffected. Once this tree is
   installed (configure takes the triple from `$CC -dumpmachine`) it can go.
 
@@ -549,10 +587,11 @@ job if it changed.
 - **Older helpers.** A daemon without protocol 4 rejects the connection and
   the host is backed off. A protocol-4 helper without `Q`/`T` query coverage
   has its object discarded and the job takes the classic path.
-- **Disk on the M6**: about 3.3 GB (2.0 GB mirror, the copied Homebrew kegs
-  and kicad-mac-builder); it has 135 GB free.
+- **Remote disk space:** synchronization needs room for source/build trees
+  and matching dependency installations; the amount depends on the project.
 - **Spotlight on the helper** indexes the mirror after each sync. Excluding
-  `~/Git` in Spotlight's privacy settings on the M6 needs the user (admin).
+  the synchronized trees in the remote Mac's Spotlight privacy settings
+  needs the user (admin).
 
 ## Implementation plan and status
 
@@ -634,17 +673,21 @@ two-machine project benchmark.
 
 ### Filesystem-query validation (2026-10-08)
 
-On the development Mac with pump mode disabled, `make check` passed 102
-integration cases and 13 focused tests. Seven existing environment-specific
+For the initial query-aware implementation, on the development Mac with
+pump mode disabled, `make check` passed 102 integration cases and 13 focused
+tests. Seven existing environment-specific
 cases were skipped (missing `/usr/include`, unavailable gdb, and an
 assembler-specific case). `make install-programs DESTDIR=...` also placed
 the observer in the configured library directory in a temporary staging tree.
 
 The focused tests are `test/test_distcc_mirror.py` (compile/comparison exit
-status), `test/test_mirror_sync_rsh.py` (transport selection and quoting,
+status, capacity detection and combined build budgets),
+`test/test_mirror_sync_rsh.py` (transport selection and quoting,
 using fake remote commands), and `test/test_mirror_trace.py` (actual macOS
 filesystem calls, optional-header queries and PCHs). Run them together with
 `make mirror-tools-check`; `make check` includes this target.
+The later generic setup change added eight capacity/build regressions,
+bringing the focused target to 21 tests.
 
 A loopback benchmark compared the final query-aware implementation with
 commit `370f1a6` using `/usr/bin/clang++`, its implicit SDK and two isolated
@@ -726,62 +769,7 @@ same slot counts produced objects byte-identical to the local run for all
 `fmt` case above). Its time (294 s) is not comparable: the host was in use
 during that run.
 
-## Using it with Ohmly
-
-Nothing in Ohmly was changed. Everything below is driven by
-`contrib/distcc-mirror` (installed as `~/.local/distcc-mirror/bin/distcc-mirror`)
-and its config `~/.config/distcc-mirror/ohmly.conf`:
-
-```sh
-ROOTS=~/Git/Ohmly
-BUILD_DIR=~/Git/Ohmly/build-dev            # a symlink to /Volumes/ExternalSSD/Developer/Ohmly/build-dev
-EXCLUDE=.git:build-release:output:tmp
-EXTRA=~/Github/kicad-mac-builder/build/wxwidgets-dest:~/Github/kicad-mac-builder/build/python-dest:~/Github/kicad-mac-builder/build/ngspice-dest
-HELPERS="m6=172.31.250.2/14"
-LOCAL_JOBS=17
-PORT=3634
-CLIENT_ADDR=172.31.250.1
-PREFIX=~/.local/distcc-mirror
-CCACHE_PREFIX=~/.local/distcc-mirror/bin/distcc
-```
-
-It was written by `distcc-mirror init --helper m6=172.31.250.2/14 --build
-build-dev --local-jobs 17 --exclude output:tmp --extra ...`. The
-environment it gives is the one the benchmark set by hand, with
-`DISTCC_MIRROR_PATHMAP` derived from the `BUILD_DIR` symlink. A build is
-
-```sh
-cd ~/Git/Ohmly && distcc-mirror build        # PCHs, sync, ninja -j31
-```
-
-`distcc-mirror helper install` replaces the hand-started M6 daemon (port
-3634, `--jobs 14`, `--mirror-root ~/Git/Ohmly`) with a LaunchAgent
-(`local.distcc-mirror.distccd.3634`), next to the Homebrew one on 3632.
-`distcc-mirror doctor` checks both Macs, and `distcc-mirror test` compiles
-random Ohmly TUs on the M6 and compares them with local compiles: 6 of 6
-mirrored and byte-identical, and 4 of 4 PCH TUs through ccache with
-`CCACHE_PREFIX` pointing at distcc directly.
-
-`dev-tools/distcc-clang.sh` is no longer needed with this tree:
-
-- its target triple fix was for Homebrew 3.4's `arm-apple-darwin` (this
-  build uses `arm64-apple-darwin27.0.0`, and Ohmly's absolute
-  `/usr/bin/clang++` is not rewritten anyway);
-- distcc now drops CMake's `-Xclang -include-pch -Xclang <pch> -Xclang
-  -include -Xclang <header>` from the remote command of a classic job
-  itself (`dcc_strip_local_args`). The local `-E` has already expanded the
-  PCH, so the remote compile gives an object identical to a direct
-  compile. Before, the remote compile failed, was redone locally, and the
-  helper was backed off for a minute;
-- distcc keeps PCH generation local by itself (`-x *-header`,
-  `-emit-pch`).
-
-Dropping it also saves its per-job `/usr/bin/clang -dumpmachine` (about
-35 ms of host CPU). `dev-tools/ohmly.sh` cannot be used for this unchanged:
-it checks that `~/.distcc/hosts` names `172.31.250.2` without options, and
-it does not run the sync.
-
-## Expected gain (estimates)
+## Historical throughput estimates
 
 Per helper slot, a PCH job today occupies cpp (slot idle) + `.ii` transfer +
 compile from `.ii`. Mirrored it occupies compile with PCH + `.o` transfer.
@@ -846,7 +834,7 @@ Link throughput: `find build-dev -name '*.pch' -exec cat {} + | ssh m6 'wc
 -c'` (658,549,964 bytes, 3.89 s). Tree walk: `rsync -an --stats` of `Ohmly/`
 (with the excludes above) to an empty local scratch dir, 3.65 s.
 
-## Appendix: M6 setup and checks (2026-10-06 and 2026-10-07)
+## Appendix: historical remote Mac setup and checks (2026-10-06 and 2026-10-07)
 
 What was changed on the M6, over `ssh m6`, to bring it to header parity with
 the host. A copy of this list lives on the M6 in `~/M6-SETUP-NOTES.md`. The
@@ -897,3 +885,60 @@ read-only:
 | 6984 external headers from ninja's deps log | after the keg copy and CLT update: identical size, mtime (symlinks followed) and content on both Macs |
 | SHA-256 of the 6413 Homebrew and CLT headers | 61 MB, 0.28 s on the host |
 | argv of an Ohmly compile after ccache | all inputs absolute logical paths; only `-o`, `-MF`, `-MT` relative; no `/Volumes` path |
+
+## Appendix: historical Ohmly project configuration (2026-10-07)
+
+This records the benchmark project configuration, including its explicit
+slot overrides and SSH alias. It is not the generic setup procedure.
+Nothing in Ohmly was changed. Everything below was driven by
+`contrib/distcc-mirror` (installed as `~/.local/distcc-mirror/bin/distcc-mirror`)
+and its config `~/.config/distcc-mirror/ohmly.conf`:
+
+```sh
+ROOTS=~/Git/Ohmly
+BUILD_DIR=~/Git/Ohmly/build-dev            # a symlink to /Volumes/ExternalSSD/Developer/Ohmly/build-dev
+EXCLUDE=.git:build-release:output:tmp
+EXTRA=~/Github/kicad-mac-builder/build/wxwidgets-dest:~/Github/kicad-mac-builder/build/python-dest:~/Github/kicad-mac-builder/build/ngspice-dest
+HELPERS="m6=172.31.250.2/14"
+LOCAL_JOBS=17
+PORT=3634
+CLIENT_ADDR=172.31.250.1
+PREFIX=~/.local/distcc-mirror
+CCACHE_PREFIX=~/.local/distcc-mirror/bin/distcc
+```
+
+It was written by `distcc-mirror init --helper m6=172.31.250.2/14 --build
+build-dev --local-jobs 17 --exclude output:tmp --extra ...`. The
+environment it gives is the one the benchmark set by hand, with
+`DISTCC_MIRROR_PATHMAP` derived from the `BUILD_DIR` symlink. A build is
+
+```sh
+cd ~/Git/Ohmly && distcc-mirror build        # PCHs, sync, ninja -j31
+```
+
+`distcc-mirror helper install` replaces the hand-started M6 daemon (port
+3634, `--jobs 14`, `--mirror-root ~/Git/Ohmly`) with a LaunchAgent
+(`local.distcc-mirror.distccd.3634`), next to the Homebrew one on 3632.
+`distcc-mirror doctor` checks both Macs, and `distcc-mirror test` compiles
+random Ohmly TUs on the M6 and compares them with local compiles: 6 of 6
+mirrored and byte-identical, and 4 of 4 PCH TUs through ccache with
+`CCACHE_PREFIX` pointing at distcc directly.
+
+`dev-tools/distcc-clang.sh` is no longer needed with this tree:
+
+- its target triple fix was for Homebrew 3.4's `arm-apple-darwin` (this
+  build uses `arm64-apple-darwin27.0.0`, and Ohmly's absolute
+  `/usr/bin/clang++` is not rewritten anyway);
+- distcc now drops CMake's `-Xclang -include-pch -Xclang <pch> -Xclang
+  -include -Xclang <header>` from the remote command of a classic job
+  itself (`dcc_strip_local_args`). The local `-E` has already expanded the
+  PCH, so the remote compile gives an object identical to a direct
+  compile. Before, the remote compile failed, was redone locally, and the
+  helper was backed off for a minute;
+- distcc keeps PCH generation local by itself (`-x *-header`,
+  `-emit-pch`).
+
+Dropping it also saves its per-job `/usr/bin/clang -dumpmachine` (about
+35 ms of host CPU). `dev-tools/ohmly.sh` cannot be used for this unchanged:
+it checks that `~/.distcc/hosts` names `172.31.250.2` without options, and
+it does not run the sync.

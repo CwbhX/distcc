@@ -18,11 +18,15 @@ One config file per project (~/.config/distcc-mirror/<name>.conf) holds
 everything: the source roots, the build directory, the helpers.  The
 commands below read it, so no environment variables have to be set by hand.
 
-Getting started, on the machine that runs the builds:
+Target setup: a main Mac runs the builds, and a remote Mac contributes
+compilation capacity over a Thunderbolt 4 network bridge. Either role can
+use any supported Mac model; slot counts come from detected cores.
 
-  contrib/distcc-mirror install --helper m6       build, install here and on m6
-  distcc-mirror init --helper m6 --build build    write the project's config
-  distcc-mirror helper install                    start the daemon on m6 (LaunchAgent)
+Getting started, on the main Mac (remote-mac is your remote SSH name):
+
+  contrib/distcc-mirror install --helper remote-mac  install on both Macs
+  distcc-mirror init --helper remote-mac --build build  detect cores and configure
+  distcc-mirror helper install                    start the remote daemon (LaunchAgent)
   distcc-mirror doctor                            check both machines match
   distcc-mirror build                             PCHs, sync, ninja
 
@@ -155,7 +159,33 @@ def under(path, root):
 
 
 def ncpu():
-    return os.cpu_count() or 4
+    count = os.cpu_count()
+    if not count or count < 1:
+        die("cannot detect the main machine's core count")
+    return count
+
+
+def slots(value, machine):
+    try:
+        count = int(value)
+    except (ValueError, TypeError):
+        count = 0
+    if count < 1:
+        die("%s needs a positive compile slot count" % machine)
+    return count
+
+
+def automatic_jobs(cores, machine):
+    try:
+        count = int(cores)
+    except (ValueError, TypeError):
+        count = 0
+    if count < 1:
+        die("cannot detect the core count for %s; give an explicit slot "
+            "count or fix core detection" % machine)
+    # Keep cores busy while some jobs wait for I/O. This is a default policy,
+    # independent of Mac model; explicit slot overrides remain available.
+    return count + 2
 
 
 def run(cmd, **kw):
@@ -199,13 +229,15 @@ def parse_config_file(path):
 
 
 class Helper:
-    def __init__(self, spec, port):
+    def __init__(self, spec, port, rsh=""):
         m = re.match(r"^([^=/\s]+)(?:=([^/\s]+))?(?:/(\d+))?$", spec)
         if not m:
             die("bad helper %r: expected ssh-name[=address][/slots]" % spec)
         self.ssh = m.group(1)
         self.addr = m.group(2) or ssh_hostname(m.group(1))
-        self.jobs = int(m.group(3) or 8)
+        machine = "remote Mac %s" % self.ssh
+        self.jobs = slots(m.group(3), machine) if m.group(3) else \
+            automatic_jobs(remote_cpu_info(self.ssh, rsh).get("ncpu"), machine)
         self.port = port
 
     def spec(self):
@@ -228,12 +260,13 @@ class Config:
         self.extra = split_colon(v.get("EXTRA"))
         self.prefix = os.path.abspath(v.get("PREFIX") or DEFAULT_PREFIX)
         self.port = int(v.get("PORT") or DEFAULT_PORT)
-        self.local_jobs = int(v.get("LOCAL_JOBS") or ncpu() + 2)
+        self.local_jobs = slots(v["LOCAL_JOBS"], "main Mac") \
+            if v.get("LOCAL_JOBS") else automatic_jobs(ncpu(), "main Mac")
         self.client_addr = v.get("CLIENT_ADDR", "")
         self.installed = v.get("INSTALLED", "")
         self.rsh = v.get("RSH", "")
         self.daemon_args = shlex.split(v.get("DAEMON_ARGS", ""))
-        self.helpers = [Helper(h, self.port)
+        self.helpers = [Helper(h, self.port, self.rsh)
                         for h in v.get("HELPERS", "").split()]
         if "PATHMAP" in v:
             self.pathmap = v["PATHMAP"]
@@ -365,6 +398,15 @@ def remote(cfg_or_rsh, host, script, args=(), capture=True):
                            + " ".join(shlex.quote(a) for a in args)]
     return subprocess.run(cmd, input=script, text=True,
                           capture_output=capture)
+
+
+def remote_cpu_info(host, rsh=""):
+    """Detect capacity and the main machine's address over the chosen SSH link."""
+    r = remote(rsh, host, 'echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null '
+               '|| nproc)"; echo "client=${SSH_CONNECTION%% *}"')
+    if r.returncode != 0:
+        die("cannot ssh to %s: %s" % (host, r.stderr.strip()))
+    return Facts(r.stdout)
 
 
 def local_script(script, args=()):
@@ -654,7 +696,13 @@ def cmd_init(args):
         die("give at least one --helper SSH_NAME")
     port = args.port or DEFAULT_PORT
 
-    step("Looking at the helpers")
+    local_cores = ncpu() if args.local_jobs is None else None
+    local_jobs = automatic_jobs(local_cores, "main Mac") \
+        if local_cores is not None else slots(args.local_jobs, "main Mac")
+    step("Detecting main and remote Mac capacity")
+    info("  main Mac: %d slots (%s)" % (local_jobs,
+         "%d detected cores + 2" % local_cores if local_cores is not None
+         else "manual override"))
     helpers, client_addr = [], args.client_addr or ""
     for spec in args.helper:
         m = re.match(r"^([^=/\s]+)(?:=([^/\s]+))?(?:/(\d+))?$", spec)
@@ -662,17 +710,20 @@ def cmd_init(args):
             die("bad --helper %r: expected ssh-name[=address][/slots]" % spec)
         ssh, addr, jobs = m.groups()
         addr = addr or ssh_hostname(ssh)
+        manual_jobs = bool(jobs)
+        if jobs:
+            jobs = slots(jobs, "remote Mac %s" % ssh)
         if not jobs or not client_addr:
-            r = remote("", ssh, 'echo "ncpu=$(sysctl -n hw.ncpu 2>/dev/null '
-                       '|| nproc)"; echo "client=${SSH_CONNECTION%% *}"')
-            if r.returncode != 0:
-                die("cannot ssh to %s: %s" % (ssh, r.stderr.strip()))
-            f = Facts(r.stdout)
-            jobs = jobs or str(int(f.get("ncpu", "6")) + 2)
+            f = remote_cpu_info(ssh)
+            jobs = jobs or automatic_jobs(f.get("ncpu"), "remote Mac %s" % ssh)
             client_addr = client_addr or f.get("client")
         helpers.append("%s=%s/%s" % (ssh, addr, jobs))
-        info("  %s: address %s, %s slots" % (ssh, addr, jobs))
-    info("  this machine, as the helpers see it: %s" % client_addr)
+        info("  remote Mac %s: address %s, %s slots (%s)" % (
+            ssh, addr, jobs, "manual override" if manual_jobs else
+            "%d detected cores + 2" % (jobs - 2)))
+    info("  main Mac address seen by the remote: %s" % client_addr)
+    info("  combined build budget: %d jobs" %
+         (local_jobs + sum(int(h.rsplit('/', 1)[1]) for h in helpers)))
 
     excludes = [".git"]
     for d in sorted(glob.glob(os.path.join(root, "*"))):
@@ -682,7 +733,6 @@ def cmd_init(args):
     excludes += [e for x in (args.exclude or []) for e in split_colon(x)]
     extra = [os.path.abspath(os.path.expanduser(e))
              for x in (args.extra or []) for e in split_colon(x)]
-    local_jobs = args.local_jobs or ncpu() + 2
     prefix = os.path.abspath(os.path.expanduser(args.prefix or DEFAULT_PREFIX))
 
     env = {}
@@ -715,13 +765,13 @@ def cmd_init(args):
         "EXCLUDE=%s" % ":".join(excludes),
         "# More trees to copy whole, e.g. dependencies built locally.",
         "EXTRA=%s" % ":".join(tilde(e) for e in extra),
-        "# Helpers: ssh-name=address/slots, space-separated.",
+        "# Remote Macs: ssh-name=address/slots, space-separated.",
         "HELPERS=\"%s\"" % " ".join(helpers),
-        "# Compile slots on this machine.",
+        "# Compile slots on the main Mac (detected cores + 2 unless overridden).",
         "LOCAL_JOBS=%d" % local_jobs,
         "# Port of the mirror daemon on the helpers.",
         "PORT=%d" % port,
-        "# This machine's address as the helpers see it (their --allow).",
+        "# Main Mac address as the remote sees it (its --allow).",
         "CLIENT_ADDR=%s" % client_addr,
         "# Where distcc is installed, on every machine.",
         "PREFIX=%s" % tilde(prefix),
@@ -752,9 +802,9 @@ def cmd_show(args):
     if cfg.build_dir and os.path.realpath(cfg.build_dir) != cfg.build_dir:
         info("            really %s" % tilde(os.path.realpath(cfg.build_dir)))
     for h in cfg.helpers:
-        info("helper      %s (%s:%d, %d slots)" % (h.ssh, h.addr, h.port,
+        info("remote Mac  %s (%s:%d, %d slots)" % (h.ssh, h.addr, h.port,
                                                    h.jobs))
-    info("local       %d slots; ninja -j%d" % (cfg.local_jobs,
+    info("main Mac    %d slots; ninja -j%d" % (cfg.local_jobs,
                                                cfg.total_jobs()))
     info("prefix      %s" % tilde(cfg.prefix))
     info("\nenvironment:")
@@ -1503,7 +1553,8 @@ def main():
 
     s = sub.add_parser("init", help="write a config for a project")
     s.add_argument("--helper", action="append", metavar="SSH[=ADDR][/SLOTS]",
-                   help="a helper, by its ssh name (repeatable)")
+                   help="remote Mac SSH name (repeatable); slots default to "
+                   "its detected core count + 2")
     s.add_argument("--build", metavar="DIR", help="build directory "
                    "(default: the one with build.ninja here or in the root)")
     s.add_argument("--root", metavar="DIR", help="source root (default: the "
@@ -1513,7 +1564,8 @@ def main():
                    help="more top-level names not to sync")
     s.add_argument("--extra", action="append", metavar="DIRS",
                    help="more trees to sync whole")
-    s.add_argument("--local-jobs", type=int, metavar="N")
+    s.add_argument("--local-jobs", type=int, metavar="N",
+                   help="main Mac compile slots (default: detected cores + 2)")
     s.add_argument("--port", type=int)
     s.add_argument("--client-addr", metavar="ADDR")
     s.add_argument("--prefix")
