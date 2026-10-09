@@ -953,6 +953,8 @@ def cmd_test(args):
     tmp = tempfile.mkdtemp(prefix="distcc-mirror-test.")
     counts = {}
     different = 0
+    compile_failed = 0
+    comparison_failed = 0
     try:
         for directory, src, argv in pick:
             obj = os.path.join(tmp, "out.o")
@@ -964,7 +966,11 @@ def cmd_test(args):
             secs = time.time() - t0
             what, why = classify(r.stderr)
             if r.returncode != 0:
-                what, why = "compile error", r.stderr.strip().splitlines()[-1]
+                compile_failed += 1
+                lines = r.stderr.strip().splitlines()
+                what = "compile error"
+                why = lines[-1] if lines else (
+                    "distcc exited with status %d (no diagnostics)" % r.returncode)
             same = ""
             if not args.no_compare and r.returncode == 0:
                 os.rename(obj, obj + ".mirror")
@@ -976,6 +982,13 @@ def cmd_test(args):
                         else:
                             same = "OBJECT DIFFERS"
                             different += 1
+                else:
+                    comparison_failed += 1
+                    same = "LOCAL COMPILE FAILED"
+                    lines = l.stderr.decode(errors="replace").strip().splitlines()
+                    why = lines[-1] if lines else (
+                        "local compiler exited with status %d (no diagnostics)"
+                        % l.returncode)
             counts[what] = counts.get(what, 0) + 1
             color = "32" if what == "mirrored" else "33"
             rel = src
@@ -984,7 +997,8 @@ def cmd_test(args):
                     rel = os.path.relpath(src, root)
             info("  %s %5.1fs  %s%s" % (
                 _c(color, "%-17s" % what), secs, rel,
-                ("  [%s]" % _c("31" if "DIFF" in same else "2", same))
+                ("  [%s]" % _c("31" if "DIFF" in same or "FAILED" in same
+                              else "2", same))
                 if same else ""))
             if why:
                 info("      " + _c("2", why))
@@ -996,12 +1010,21 @@ def cmd_test(args):
     info("")
     info("summary: " + ", ".join("%d %s" % (n, w)
                                  for w, n in sorted(counts.items())))
-    if counts.get("mirrored", 0) < len(pick):
-        info("Jobs that were not mirrored still built correctly (the "
-             "classic way).  If\nmany are rejected, run distcc-mirror sync, "
+    if comparison_failed:
+        info("%d local comparison compile(s) failed" % comparison_failed)
+    if counts.get("mirrored", 0) < len(pick) - compile_failed:
+        info("Some jobs compiled successfully using classic distcc.  If\n"
+             "many are rejected, run distcc-mirror sync, "
              "then distcc-mirror doctor.")
+    failures = []
+    if compile_failed:
+        failures.append("%d distcc compile(s) failed" % compile_failed)
+    if comparison_failed:
+        failures.append("%d local comparison compile(s) failed" % comparison_failed)
     if different:
-        die("%d object(s) differ from a local compile" % different)
+        failures.append("%d object(s) differ from a local compile" % different)
+    if failures:
+        die("; ".join(failures))
 
 
 # ---------------------------------------------------------------- doctor
