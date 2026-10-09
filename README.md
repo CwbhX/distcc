@@ -108,7 +108,7 @@ an unsupported option, or a file differs) falls back to classic mode.
 
 Mirror mode observes the compiler's actual header lookups, including failed
 `__has_include` checks, without adding local preprocessing. The observer
-currently supports the audited arremote-mac4 Apple clang 21.0.0
+currently supports the audited arm64 Apple clang 21.0.0
 (`clang-2100.3.34.2`) binary identified by SHA-256 in
 `src/mirror_ident.c`. Other compiler builds and wrappers use classic mode.
 Install the updated client, helper and tracing library together; an older
