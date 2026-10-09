@@ -1,8 +1,10 @@
 # Performance findings: two-Mac distcc pool over Thunderbolt
 
-Notes from an investigation on 2026-10-06. Nothing in this tree has been
-changed yet; this file records what was measured and what is worth changing,
-so the work can be picked up later.
+Historical notes from an investigation on 2026-10-06, before the fork's
+performance and mirror-mode changes. Machine names, SSH aliases, addresses
+and core counts identify that measured test pair. They are not configuration
+requirements. The current [setup guide](../README.md#quick-start) uses main
+and remote Mac roles over Thunderbolt 4 and detects each machine's capacity.
 
 ## Setup that was measured
 

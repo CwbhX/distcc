@@ -1,11 +1,12 @@
-# distcc (mac-pool-perf fork)
+# distcc (mirror-mode fork)
 
 A distributed C/C++ compiler: distcc spreads the compile jobs of a build
 across several machines on a network. Its output is the same as a local
 compile's.
 
-This fork adds features for a small pool of Macs on a fast link, such as two
-Mac minis joined by a Thunderbolt bridge. It is based on
+This fork targets a **main Mac** running builds and a **remote Mac**
+contributing compilation capacity over a **Thunderbolt 4 network bridge**.
+The roles do not depend on Mac model or chip generation. It is based on
 [distcc/distcc](https://github.com/distcc/distcc) (3.4 plus later upstream
 commits). Without the new options it behaves like upstream distcc and talks
 to upstream daemons.
@@ -26,24 +27,33 @@ to upstream daemons.
 
 ## Quick start
 
-Two Macs: the **client** runs your builds, and the **helper** (here the ssh
-host `m6`) lends its cores. On the client:
+The **main Mac** (the distcc client) runs your build. The **remote Mac**
+(the distcc helper) runs the compilation daemon. Connect them with a
+Thunderbolt 4 cable, enable Thunderbolt Bridge networking and Remote Login
+on the remote Mac, and check SSH access from the main Mac.
+
+In these commands, `remote-mac` is an example SSH name pointing to the
+remote Mac's Thunderbolt Bridge address; use your own SSH alias or address.
+On the main Mac:
 
 ```sh
-git clone -b mac-pool-perf https://github.com/CwbhX/distcc.git && cd distcc
+git clone https://github.com/CwbhX/distcc.git && cd distcc
 brew install autoconf automake pkgconf popt
-contrib/distcc-mirror install --helper m6        # build; install here and on m6
+contrib/distcc-mirror install --helper remote-mac        # build and install on both Macs
 export PATH="$HOME/.local/distcc-mirror/bin:$PATH"
 
 cd ~/src/MyProject                               # a CMake + Ninja project
-distcc-mirror init --helper m6 --build build     # writes ~/.config/distcc-mirror/myproject.conf
-distcc-mirror helper install                     # starts the daemon on m6 (LaunchAgent)
+distcc-mirror init --helper remote-mac --build build     # writes ~/.config/distcc-mirror/myproject.conf
+distcc-mirror helper install                     # starts the remote daemon (LaunchAgent)
 distcc-mirror doctor                             # checks that both Macs match
-distcc-mirror build                              # PCHs, sync to m6, ninja
+distcc-mirror build                              # PCHs, sync, then use both Macs
 ```
 
 Every step works out the details itself (addresses, slot counts, ccache,
 build directories behind symlinks), and `doctor` tells you what to fix.
+`init` detects each Mac's logical core count, starts with cores + 2 compile
+slots on each, and `build` uses their combined slot count. Manual slot
+overrides are optional; no Mac model selects a different policy.
 
 ## What's new in this fork
 
@@ -63,15 +73,16 @@ build directories behind symlinks), and `doctor` tells you what to fix.
 ## Results
 
 Full rebuild of a 3481-TU C++ project (CMake + Ninja + ccache with a cold
-cache). The host is an M5 Pro Mac mini (15 cores) and the helper an M6 Mac
-mini (12 cores), joined by a Thunderbolt bridge.
+cache). The tested main Mac was an M5 Pro Mac mini (15 cores) and the
+tested remote Mac an M6 Mac mini (12 cores), joined by a Thunderbolt bridge.
+These identify the benchmark hardware, not setup requirements.
 
 | Configuration | Time | vs local |
 |---|---|---|
 | Local only, 15 jobs | 472 s | 1.00x |
 | Upstream distcc 3.4, tuned (`--localslots_cpp=40`, `DISTCC_PAUSE_TIME_MSEC=20`) | 320 s | 1.48x |
-| This fork, classic mode, M6/14 + localhost/17 | 290 s | 1.63x |
-| **This fork, mirror mode, M6/14 + localhost/17** | **241 s** | **1.96x** |
+| This fork, classic mode, remote/14 + main/17 | 290 s | 1.63x |
+| **This fork, mirror mode, remote/14 + main/17** | **241 s** | **1.96x** |
 
 In that run the mirror pool ran at about the two machines' combined capacity:
 a mirrored job costs the host almost nothing. All objects were
@@ -97,7 +108,7 @@ an unsupported option, or a file differs) falls back to classic mode.
 
 Mirror mode observes the compiler's actual header lookups, including failed
 `__has_include` checks, without adding local preprocessing. The observer
-currently supports the audited arm64 Apple clang 21.0.0
+currently supports the audited arremote-mac4 Apple clang 21.0.0
 (`clang-2100.3.34.2`) binary identified by SHA-256 in
 `src/mirror_ident.c`. Other compiler builds and wrappers use classic mode.
 Install the updated client, helper and tracing library together; an older
@@ -125,10 +136,10 @@ libpopt-dev`, then the manual steps below).
 
 ### Install
 
-From the source tree, on the client:
+From the source tree, on the main Mac:
 
 ```sh
-contrib/distcc-mirror install --helper m6
+contrib/distcc-mirror install --helper remote-mac
 ```
 
 This runs `autogen.sh` and `configure` if needed, builds with popt linked
@@ -155,7 +166,7 @@ mkdir -p ~/.local/distcc-mirror/lib/distcc                # compiler whitelist
 for c in cc c++ gcc g++ clang clang++; do
   ln -sf ../../bin/distcc ~/.local/distcc-mirror/lib/distcc/$c
 done
-rsync -a ~/.local/distcc-mirror/ m6:.local/distcc-mirror/  # same build on the helper
+rsync -a ~/.local/distcc-mirror/ remote-mac:.local/distcc-mirror/  # same build on the helper
 ```
 
 On Linux a plain `make` is enough. Leave out `--disable-pump-mode` to get
@@ -170,7 +181,7 @@ pump mode.
 From inside the project:
 
 ```sh
-distcc-mirror init --helper m6 --build build
+distcc-mirror init --helper remote-mac --build build
 ```
 
 This writes `~/.config/distcc-mirror/<project>.conf`. Nothing is written
@@ -178,7 +189,7 @@ into the project itself. `init` works out:
 
 - the root (the git work tree);
 - the helper's address, from your ssh config;
-- slot counts: cores + 2 on each machine;
+- each Mac's logical core count and default slot count: detected cores + 2;
 - this Mac's address as the helper sees it;
 - other build directories to leave out of the sync;
 - whether the build uses ccache. If it does, `CCACHE_PREFIX` is set to
@@ -189,25 +200,27 @@ Useful options:
 
 | Option | Meaning |
 |---|---|
-| `--helper SSH[=ADDR][/SLOTS]` | A helper (repeatable). For example, `m6=172.31.250.2/14`. |
+| `--helper SSH[=ADDR][/SLOTS]` | Remote Mac SSH name (repeatable). Use `remote-mac` to detect its address and slots; `/SLOTS` is an optional manual override. |
 | `--extra DIRS` | More trees to sync whole, such as dependencies you built locally. |
 | `--exclude NAMES` | More top-level names not to sync, such as `output:tmp`. |
-| `--local-jobs N`, `--port N` | Slots on this Mac; the daemon port (default 3634). |
+| `--local-jobs N`, `--port N` | Optional main Mac slot override; remote daemon port (default 3634). |
 | `--set KEY=VALUE` | Any other variable to export to the build. |
 
 The config is plain `KEY=VALUE`, so edit it freely. With several projects,
 the commands pick the config whose root contains the current directory, or
-take `-c NAME`. Here is an example:
+take `-c NAME`. The generated config records the detected addresses and
+slot counts. A hand-written config can omit slot counts to detect them too;
+for example (replace the main Mac address with its Thunderbolt Bridge IP):
 
 ```sh
 ROOTS=~/Git/MyProject
 BUILD_DIR=~/Git/MyProject/build-dev     # may be a symlink to another disk
 EXCLUDE=.git:build-release
-EXTRA=~/deps/wxwidgets-dest
-HELPERS="m6=172.31.250.2/14"
-LOCAL_JOBS=17
+EXTRA=~/deps/my-library
+HELPERS="remote-mac"                 # remote cores + 2, queried over SSH
+# LOCAL_JOBS is omitted: main Mac cores + 2
 PORT=3634
-CLIENT_ADDR=172.31.250.1
+CLIENT_ADDR=198.51.100.1
 PREFIX=~/.local/distcc-mirror
 CCACHE_PREFIX=~/.local/distcc-mirror/bin/distcc
 ```
@@ -322,33 +335,40 @@ Here they are, if you want to see or script them yourself.
 <details>
 <summary>Helper daemon, client environment, sync and build</summary>
 
-On the helper (`--enable-tcp-insecure` is refused in mirror mode; a
+On the remote Mac (`--enable-tcp-insecure` is refused in mirror mode; a
 different port lets it run next to an upstream daemon on 3632):
 
 ```sh
+MAIN_ADDR=198.51.100.1                # replace with the main Mac's bridge IP
+REMOTE_ADDR=198.51.100.2              # replace with this Mac's bridge IP
+REMOTE_JOBS=$(( $(sysctl -n hw.ncpu) + 2 ))
 ~/.local/distcc-mirror/bin/distccd --daemon \
-  --listen 172.31.250.2 --port 3634 --allow 172.31.250.1/32 \
-  --jobs 14 --mirror-root "$HOME/Git/MyProject" \
+  --listen "$REMOTE_ADDR" --port 3634 --allow "$MAIN_ADDR/32" \
+  --jobs "$REMOTE_JOBS" --mirror-root "$HOME/Git/MyProject" \
   --log-file ~/Library/Logs/distccd-mirror.log
 ```
 
 The daemon first checks that it can confine a compiler, and refuses to
 start if it can't. Add `--no-detach` when running it under launchd.
 
-On the client:
+On the main Mac:
 
 ```sh
 export PATH="$HOME/.local/distcc-mirror/bin:$PATH"
-export DISTCC_HOSTS="172.31.250.2:3634/14,mirror localhost/17"
+REMOTE_SSH=remote-mac
+REMOTE_ADDR=$(ssh -G "$REMOTE_SSH" | awk '/^hostname / {print $2; exit}')
+REMOTE_JOBS=$(ssh "$REMOTE_SSH" 'cores=$(sysctl -n hw.ncpu); echo $((cores + 2))')
+MAIN_JOBS=$(( $(sysctl -n hw.ncpu) + 2 ))
+export DISTCC_HOSTS="$REMOTE_ADDR:3634/$REMOTE_JOBS,mirror localhost/$MAIN_JOBS"
 export DISTCC_MIRROR_ROOTS="$HOME/Git/MyProject"
 export DISTCC_MIRROR_EXCLUDE=".git:build-release"
 export DISTCC_MIRROR_PATHMAP="/Volumes/SSD/MyProject/build=$HOME/Git/MyProject/build"
-export DISTCC_MIRROR_SSH=m6
+export DISTCC_MIRROR_SSH="$REMOTE_SSH"
 export CCACHE_PREFIX=distcc          # if the build uses ccache
 
 ninja -C build <pch targets>         # the helper compiles against copies of them
 distcc --mirror-sync
-ninja -C build -j31
+ninja -C build -j$((MAIN_JOBS + REMOTE_JOBS))
 ```
 
 [`contrib/mirror-build.sh`](contrib/mirror-build.sh) does the last three
@@ -367,17 +387,30 @@ out the same as on the client.
 ### Classic mode (as in upstream)
 
 ```sh
-distccd --daemon --allow 192.168.1.0/24 --jobs 12        # on each helper
-export DISTCC_HOSTS="helper/12 localhost/8"              # on the client
-make -j20 CC="distcc clang" CXX="distcc clang++"
+# On the remote Mac:
+distccd --daemon --allow 192.168.1.0/24 --jobs "$(sysctl -n hw.ncpu)"
+
+# On the main Mac:
+MAIN_JOBS=$(sysctl -n hw.ncpu)
+REMOTE_JOBS=$(ssh remote-mac sysctl -n hw.ncpu)
+export DISTCC_HOSTS="remote-mac/$REMOTE_JOBS localhost/$MAIN_JOBS"
+make -j$((MAIN_JOBS + REMOTE_JOBS)) CC="distcc clang" CXX="distcc clang++"
 ```
 
 ### Choosing slot counts
 
-On the M5 Pro + M6 pair, the best result came from a few more slots than
-cores on the helper (14 on 12 cores) and on the client (`localhost/17` on
-15 cores). Going past that didn't help. `init` picks cores + 2. Watch
-`distccmon-text 1` during a build to see where jobs are running.
+`init` detects logical cores independently on the main Mac and every remote
+Mac, then defaults each to cores + 2 slots. The small allowance keeps cores
+busy while jobs wait for I/O; it is a starting policy, not a guarantee that
+further oversubscription improves throughput. `build` sets Ninja/Make
+parallelism to the sum of these budgets.
+
+Use `--local-jobs N` for a main Mac override or `--helper remote-mac/SLOTS`
+for a remote override. Explicit `-j` arguments to `build` take precedence.
+If core detection fails, setup asks for an explicit count instead of
+guessing a machine size. Watch `distccmon-text 1` during a build to see
+where jobs are running; rerun `init --force` to refresh detected values
+after changing machines.
 
 ## Configuration reference
 
@@ -474,11 +507,13 @@ Cases that compile in the mirror require macOS write confinement and an
 audited compiler binary; they are skipped if either is unavailable. The
 observer tests are macOS-only. CLI exit-status and remote-shell tests run
 without a remote host and are also included in `make check`.
+CLI capacity tests cover different main/remote core counts, failed
+detection, manual overrides and combined build parallelism.
 
 ## Further documentation
 
 - [doc/mirrored-tree-design.md](doc/mirrored-tree-design.md): design,
-  the staleness rules, results and the M6 setup.
+  the staleness rules, generic setup and historical benchmark results.
 - [doc/protocol-4.txt](doc/protocol-4.txt): the wire protocol for mirror
   mode.
 - [doc/perf-findings-two-mac-pool.md](doc/perf-findings-two-mac-pool.md):
