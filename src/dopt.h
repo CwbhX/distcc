@@ -45,6 +45,9 @@ extern int opt_lifetime;
 extern char *opt_listen_addr;
 extern int opt_niceness;
 extern const char *arg_sysroot;
+extern char **opt_mirror_roots;
+extern int opt_n_mirror_roots;
+extern const char *arg_mirror_installed;
 
 #ifdef HAVE_LINUX
 extern int opt_oom_score_adj;

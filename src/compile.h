@@ -38,6 +38,21 @@ int dcc_compile_remote(char **argv,
 
 /* compile.c */
 
+enum dcc_mirror_outcome {
+    DCC_MIRROR_COMPILED = 1,
+    DCC_MIRROR_CLASSIC,
+    DCC_MIRROR_FAILED
+};
+
+int dcc_compile_mirror(char **argv,
+                       char *input_fname,
+                       char *output_fname,
+                       char *deps_fname,
+                       char *server_stderr_fname,
+                       struct dcc_hostdef *host,
+                       int *status,
+                       int *outcome);
+
 extern int dcc_scan_includes;
 
 int dcc_build_somewhere_timed(char *argv[],

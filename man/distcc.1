@@ -84,6 +84,9 @@ values than 8 may be used without overloading a single-CPU
 client due to preprocessing.  Such large values may speed up parts of the build
 that do not involve C compilations, but they may not be useful to distcc
 efficiency in plain mode.
+The preprocessor slots are counted separately from the local compile slots
+and do not share them, so preprocessing for remote jobs is not held up by
+local compiles.
 .PP
 In contrast, using pump mode and say 40 servers, a setting of
 .B -j80
@@ -484,7 +487,17 @@ which are useful for adjusting load on the local machine.  The
 host specifies how many jobs that cannot be run remotely that can be run concurrently
 on the local machine, while
 .B --localslots_cpp
-controls how many preprocessors will run in parallel on the local machine.  Tuning
+controls how many preprocessors will run in parallel on the local machine.
+The two limits are independent: preprocessor slots no longer share the
+local compile slots set by
+.B --localslots
+and
+.BR localhost/LIMIT ,
+so a job that already has a remote slot does not wait for a local compile to
+finish before it can preprocess.  The local machine may therefore run up to
+the local compile limit plus the
+.B --localslots_cpp
+limit of processes at once.  Tuning
 these values can improve performance.  Linking on large projects
 can take large amounts of memory.  Running parallel linkers, which cannot be
 executed remotely,  may
@@ -795,12 +808,15 @@ not time out and fallback to a local compile.  By default set to
 300 seconds.
 .TP
 .B "DISTCC_PAUSE_TIME_MSEC"
-Specifies how long (in milliseconds) distcc will pause when all
-compilation servers are in use.
-By default set to 1000 milliseconds (1 second).
-Setting this to a smaller value (e.g. 10 milliconds) may improve
-throughput for some configurations, at the expense of increased CPU
-load on the distcc client machine.
+Specifies how long (in milliseconds) distcc waits when all compilation
+slots are in use before checking all slots again.
+Where the platform supports it, distcc spends that time blocked on the lock
+of one busy slot and takes it as soon as it is released, so the value only
+bounds how long a slot freed elsewhere can go unnoticed; otherwise it simply
+sleeps for that long.
+By default set to 100 milliseconds.
+Setting it to 0 makes distcc recheck continuously instead of waiting,
+which uses more CPU on the client machine.
 .TP
 .B "DISTCC_SAVE_TEMPS"
 If set to 1, temporary files are not deleted after use.  Good for

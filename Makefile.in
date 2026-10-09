@@ -58,6 +58,8 @@ include_server_builddir = $(builddir)/_include_server
 # These must be done from here, not from autoconf, because they can
 # contain variable expansions written in Make syntax.  Ew.
 DIR_DEFS = -DLIBDIR="\"${prefix}/lib\"" -DSYSCONFDIR="\"${sysconfdir}\"" -DICONDIR="\"${icondir}\""
+DIR_DEFS += -DDISTCC_MIRROR_TRACE_LIBRARY="\"${libdir}/distcc-mirror-trace.dylib\""
+MIRROR_TRACE_LIBRARY = @MIRROR_TRACE_LIBRARY@
 
 # arguments to pkgconfig
 GNOME_PACKAGES = @GNOME_PACKAGES@
@@ -122,6 +124,8 @@ dist_contrib = contrib/distcc-absolutify	\
 	contrib/distccd-init		\
 	contrib/distccd-on-servers	\
 	contrib/dmake			\
+	contrib/distcc-mirror		\
+	contrib/mirror-build.sh		\
 	contrib/make-j			\
 	contrib/netpwd			\
 	contrib/stage-cc-wrapper.patch	\
@@ -149,7 +153,7 @@ pkgdoc_DOCS = AUTHORS COPYING NEWS \
 	TODO \
 	doc/protocol-1.txt doc/status-1.txt \
 	doc/protocol-2.txt \
-	doc/protocol-3.txt doc/protocol-3-impl.txt \
+	doc/protocol-3.txt doc/protocol-3-impl.txt doc/protocol-4.txt \
 	doc/protocol-gssapi.txt \
 	doc/reporting-bugs.txt
 
@@ -202,6 +206,9 @@ man8dir = $(mandir)/man8
 test_SOURCE = test/comfychair.py \
 	test/onetest.py \
 	test/testdistcc.py \
+	test/test_distcc_mirror.py \
+	test/test_mirror_sync_rsh.py \
+	test/test_mirror_trace.py \
 	find_c_extension.sh
 
 dist_common = Makefile.in install-sh configure configure.ac \
@@ -241,6 +248,9 @@ common_obj = src/arg.o src/argutil.o					\
 	src/sendfile.o							\
 	src/safeguard.o src/snprintf.o src/timeval.o			\
 	src/dotd.o 							\
+	src/mirror.o src/mirror_digest.o src/mirror_ident.o		\
+	src/mirror_search.o						\
+	src/sha256.o							\
 	src/hosts.o src/hostfile.o					\
 	src/implicit.o src/loadfile.o					\
 	lzo/minilzo.o                                                   \
@@ -248,6 +258,7 @@ common_obj = src/arg.o src/argutil.o					\
 	@AUTH_COMMON_OBJS@
 
 distcc_obj = src/backoff.o						\
+	src/mirror_client.o src/mirror_sync.o				\
 	src/climasq.o src/clinet.o src/clirpc.o				\
 	src/compile.o src/cpp.o						\
 	src/distcc.o							\
@@ -263,6 +274,7 @@ distcc_obj = src/backoff.o						\
 
 distccd_obj = src/access.o						\
 	src/daemon.o  src/dopt.o src/dparent.o src/dsignal.o		\
+	src/confine.o src/mirror_serve.o				\
 	src/ncpus.o							\
 	src/prefork.o							\
 	src/stringmap.o							\
@@ -308,8 +320,10 @@ h_fix_debug_info = src/h_fix_debug_info.o $(common_obj)
 h_compile_obj = src/h_compile.o $(common_obj) src/compile.o src/timefile.o \
                 src/backoff.o src/emaillog.o src/remote.o src/clinet.o \
 	        src/clirpc.o src/include_server_if.o src/state.o src/where.o \
-		src/ssh.o src/strip.o src/cpp.o @AUTH_DISTCC_OBJS@
+		src/ssh.o src/strip.o src/cpp.o src/mirror_client.o \
+		@AUTH_DISTCC_OBJS@
 h_getline_obj = src/h_getline.o $(common_obj)
+h_mirror_obj = src/h_mirror.o src/confine.o $(common_obj)
 
 # All source files, for the purposes of building the distribution
 SRC =	src/stats.c							\
@@ -325,6 +339,11 @@ SRC =	src/stats.c							\
 	src/h_exten.c src/h_hosts.c src/h_issource.c src/h_parsemask.c	\
 	src/h_sa2str.c src/h_scanargs.c src/h_strip.c			\
 	src/h_dotd.c src/h_compile.c src/h_getline.c			\
+	src/h_mirror.c src/mirror.c src/mirror_digest.c src/sha256.c	\
+	src/mirror_ident.c src/mirror_search.c				\
+	src/confine.c src/mirror_client.c src/mirror_serve.c		\
+	src/mirror_sync.c						\
+	src/mirror_trace.c						\
 	src/help.c src/history.c src/hosts.c src/hostfile.c		\
 	src/implicit.c src/io.c						\
 	src/loadfile.c src/lock.c 					\
@@ -367,6 +386,9 @@ HEADERS = src/stats.h							\
 	src/exec.h src/lock.h src/where.h src/srvnet.h			\
 	src/rslave.h							\
 	src/dotd.h src/include_server_if.h				\
+	src/mirror.h src/sha256.h src/confine.h src/mirror_trace.h		\
+	src/mirror_client.h src/mirror_serve.h src/mirror_sync.h	\
+	src/mirror_search.h						\
 	src/emaillog.h 							\
 	src/va_copy.h 							\
 	src/zeroconf.h
@@ -378,11 +400,14 @@ conf_files = $(conf_dir)/hosts \
 default_dir = packaging/RedHat/default
 default_files = $(default_dir)/distcc
 
-man1_MEN = man/distcc.1 man/distccd.1 man/distccmon-text.1 \
-           man/lsdistcc.1 man/pump.1 man/include_server.1
+base_man1_MEN = man/distcc.1 man/distccd.1 man/distccmon-text.1 \
+           man/lsdistcc.1
+pump_man1_MEN = man/pump.1 man/include_server.1
+# Man pages to install: the pump ones are left out with --disable-pump-mode.
+man1_MEN = $(base_man1_MEN) @PUMP_MAN1@
 man_HTML = man/distcc_1.html man/distccd_1.html man/distccmon_text_1.html \
            man/lsdistcc_1.html man/pump_1.html man/include_server_1.html
-MEN = $(man1_MEN)
+MEN = $(base_man1_MEN) $(pump_man1_MEN)
 
 gnome_data = gnome/distccmon-gnome.png	\
 	gnome/distccmon-gnome.desktop
@@ -421,7 +446,8 @@ check_PROGRAMS = \
 	h_strip@EXEEXT@ \
 	h_dotd@EXEEXT@ \
 	h_compile@EXEEXT@ \
-	h_getline@EXEEXT@
+	h_getline@EXEEXT@ \
+	h_mirror@EXEEXT@
 
 check_include_server_PY = \
 	include_server/c_extensions_test.py \
@@ -451,7 +477,8 @@ check_include_server_PY = \
 
 ## NOTE: "all" must be the first (default) rule, aside from patterns.
 
-all: $(bin_PROGRAMS) $(sbin_PROGRAMS) pump include-server
+# The pump script and include server are left out with --disable-pump-mode.
+all: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(MIRROR_TRACE_LIBRARY) @PUMP_ALL@
 
 #  src/config.h.in is used by config.status
 Makefile: Makefile.in src/config.h.in config.status
@@ -483,6 +510,12 @@ pump: pump.in config.status
 
 # Grab the dependency files generated by gcc's -MD option.
 -include */*.d
+
+src/mirror_trace.o: $(srcdir)/src/mirror_trace.c $(srcdir)/src/mirror_trace.h
+	$(CC) $(CPPFLAGS) $(WERROR_CFLAGS) $(CFLAGS) -fPIC -c -o $@ $<
+
+distcc-mirror-trace.dylib: src/mirror_trace.o
+	$(CC) $(CFLAGS) $(LDFLAGS) -dynamiclib -o $@ src/mirror_trace.o
 
 distcc@EXEEXT@: $(distcc_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(distcc_obj) $(LIBS)
@@ -530,6 +563,9 @@ h_ccvers@EXEEXT@: $(h_ccvers_obj)
 
 h_dotd@EXEEXT@: $(h_dotd_obj)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(h_dotd_obj) $(LIBS)
+
+h_mirror@EXEEXT@: $(h_mirror_obj)
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(h_mirror_obj) $(LIBS)
 
 h_fix_debug_info@EXEEXT@: $(h_fix_debug_info)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $(h_fix_debug_info) $(LIBS)
@@ -678,11 +714,11 @@ man/include_server_1.html: man/include_server.1
 .PHONY: check_programs
 .PHONY: maintainer-check-no-set-path distcc-maintainer-check
 .PHONY: include-server-maintainer-check pump-maintainer-check
-.PHONY: maintainer-check
+.PHONY: maintainer-check mirror-tools-check
 .PHONY: check
 .PHONY: lzo-check valgrind-check single-test pump-single-test
 
-check_programs: $(check_PROGRAMS) $(bin_PROGRAMS)
+check_programs: $(check_PROGRAMS) $(bin_PROGRAMS) $(MIRROR_TRACE_LIBRARY)
 
 TESTDISTCC_OPTS =
 
@@ -757,8 +793,15 @@ pump-maintainer-check: pump include-server check_programs
 # Do distcc-maintainer-check, for non-pumped distcc, and try the include_server
 # check to check the include server's behavior, if applicable.  If the include
 # server exists, then carry out distcc-maintainer-check in pump-mode.
-maintainer-check: distcc-maintainer-check include-server-maintainer-check \
-	pump-maintainer-check
+# The pump-mode checks are left out with --disable-pump-mode.
+mirror-tools-check: distcc $(MIRROR_TRACE_LIBRARY)
+	$(PYTHON) "$(srcdir)/test/test_distcc_mirror.py"
+	DISTCC_TEST_BINARY="$(builddir)/distcc" \
+	  $(PYTHON) "$(srcdir)/test/test_mirror_sync_rsh.py"
+	DISTCC_MIRROR_TRACE_LIBRARY="$(abspath $(MIRROR_TRACE_LIBRARY))" \
+	  $(PYTHON) "$(srcdir)/test/test_mirror_trace.py"
+
+maintainer-check: distcc-maintainer-check mirror-tools-check @CHECK_PUMP@
 
 check:
 	@if test -n "$(PYTHON)"; then \
@@ -843,7 +886,7 @@ pump-installcheck:
 # The maintainer-installcheck does not run the include server unit tests;
 # but the integration tests in 'test' are run in pump mode.
 maintainer-installcheck: verify-binaries-installcheck distcc-installcheck \
-	pump-installcheck
+	@INSTALLCHECK_PUMP@
 
 installcheck:
 	@if test -n "$(PYTHON)"; then \
@@ -916,6 +959,7 @@ clean: clean-autoconf clean-lzo clean-include-server
 	rm -f `echo $(man1_MEN) | sed -e 's/ /.gz /g' -e 's/$$/.gz/'`
 	rm -f $(man_HTML)
 	rm -f distccmon-gnome
+	rm -f distcc-mirror-trace.dylib distcc-mirror-trace.d
 	rm -rf _testtmp  # produced by test/testdistcc.py and daemon-installcheck
 	rm -rf +distcheck
 	rm -rf "$(include_server_builddir)"
@@ -927,8 +971,13 @@ clean-lzo:
 	rm -f lzo/*.[od] lzo/testmini
 
 
+# Only ask setup.py to clean up if the include server was ever built and
+# setuptools is still there, so that "make clean" works with
+# --disable-pump-mode or without setuptools; the build directory itself is
+# removed either way.
 clean-include-server:
-	if test -n "$(PYTHON)"; then	\
+	if test -n "$(PYTHON)" && test -d "$(include_server_builddir)"	\
+	   && $(PYTHON) -c 'import setuptools' >/dev/null 2>&1; then	\
 	  DISTCC_VERSION="$(VERSION)"			\
 	  SRCDIR="$(srcdir)"                            \
 	  CFLAGS="$(CFLAGS) $(PYTHON_CFLAGS)"           \
@@ -938,6 +987,7 @@ clean-include-server:
 	         --build-base="$(include_server_builddir)"  \
 	         --build-temp="$(include_server_builddir)"; \
 	fi
+	rm -rf "$(include_server_builddir)"
 
 maintainer-clean: distclean \
 	maintainer-clean-autoconf clean
@@ -1024,17 +1074,22 @@ showpaths:
 # tricky features so mkinstalldirs and cp will do
 
 install: showpaths install-doc install-man install-programs \
-	install-include-server install-example @INSTALL_GNOME@ install-conf
+	@INSTALL_PUMP@ install-example @INSTALL_GNOME@ install-conf
 
-install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS)
+install-programs: $(bin_PROGRAMS) $(sbin_PROGRAMS) $(MIRROR_TRACE_LIBRARY)
 	$(mkinstalldirs) "$(DESTDIR)$(bindir)"
 	$(mkinstalldirs) "$(DESTDIR)$(sbindir)"
 	for p in $(bin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(bindir)" || exit 1; \
 	done
+	$(INSTALL_SCRIPT) "$(srcdir)/contrib/distcc-mirror" "$(DESTDIR)$(bindir)"
 	for p in $(sbin_PROGRAMS); do \
 	  $(INSTALL_PROGRAM) "$$p" "$(DESTDIR)$(sbindir)" || exit 1; \
 	done
+	if test -n "$(MIRROR_TRACE_LIBRARY)"; then \
+	  $(mkinstalldirs) "$(DESTDIR)$(libdir)" && \
+	  $(INSTALL_PROGRAM) "$(MIRROR_TRACE_LIBRARY)" "$(DESTDIR)$(libdir)" || exit 1; \
+	fi
 
 # See comments for the include-server target.  Also, we work around an issue in
 # the change_root function of distutils/utils.py that turns the absolute prefix
@@ -1152,10 +1207,13 @@ install-conf: $(conf_files) $(default_files)
 # so we clean up the doc subdirectory before cleaning up doc itself.
 
 uninstall: uninstall-man uninstall-programs @UNINSTALL_GNOME@ \
-	uninstall-include-server uninstall-example uninstall-doc uninstall-conf
+	@UNINSTALL_PUMP@ uninstall-example uninstall-doc uninstall-conf
 
 uninstall-programs:
-	for p in $(bin_PROGRAMS) pump; do			\
+	for p in $(MIRROR_TRACE_LIBRARY); do \
+	  rm -f "$(DESTDIR)$(libdir)/$$p"; \
+	done
+	for p in $(bin_PROGRAMS) pump distcc-mirror; do		\
 	  file="$(DESTDIR)$(bindir)/`basename $$p`";            \
 	  if [ -e "$$file" ]; then rm -fv "$$file"; fi          \
 	done

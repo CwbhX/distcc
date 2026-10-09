@@ -1,4 +1,7 @@
 
+This is the upstream overview. For this fork's installation, mirrored-tree
+mode, compiler requirements and tests, start with README.md.
+
 	  distcc -- a free distributed C/C++ compiler system
 
 		   https://github.com/distcc/distcc

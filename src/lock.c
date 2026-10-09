@@ -71,22 +71,47 @@
 #include "exitcode.h"
 #include "snprintf.h"
 
-/* Note that we use the _same_ lock file for
- * dcc_hostdef_local and dcc_hostdef_local_cpp,
- * so that they both use the same underlying lock.
- * This ensures that we respect the limits for
- * both "localslots" and "localslots_cpp".
+/* Local lock namespaces.
+ *
+ * There are two independent pools of local slots, each with its own set of
+ * lock files:
+ *
+ *  - Local compile slots: "localhost/N" host entries and dcc_hostdef_local
+ *    ("--localslots").  These lock <lockdir>/cpu_localhost_<n>.  The two
+ *    deliberately share that one set of files, so a job that must run
+ *    locally and a job that picked localhost from the host list are
+ *    counted against the same limit.
+ *
+ *  - Local preprocessor slots: dcc_hostdef_local_cpp ("--localslots_cpp").
+ *    These lock <lockdir>/cpp_localhost_<n>.  They used to share the
+ *    cpu_localhost_<n> files with the compile slots, which meant a job that
+ *    already held a remote slot could not start preprocessing while every
+ *    local compile slot was busy, and the remote slot sat idle until a local
+ *    compile finished.  Now --localslots_cpp bounds the number of
+ *    concurrent local preprocessors on its own, independent of local
+ *    compiles.
+ *
+ * The cpp pool is recognised by pointer identity (host ==
+ * dcc_hostdef_local_cpp) in dcc_make_lock_filename(), so callers keep
+ * passing the lockname "cpu" for every slot.  Remote lock names are
+ * unchanged: <lockname>_tcp_<host>_<port>_<n> and <lockname>_ssh_<host>_<n>.
  *
  * Extreme care with lock ordering is required in order to avoid
  * deadlocks.  In particular, the following invariants apply:
  *
  *  - Each distcc process should hold no more than two locks at a time;
- *    one local lock, and one remote lock.
+ *    one local lock (either a compile slot or a preprocessor slot, never
+ *    both), and one remote lock.
  *
  *  - When acquiring more than one lock, a strict lock ordering discipline
  *    must be observed: the remote lock must be acquired first, before the
  *    local lock; and conversely the local lock must be released first,
  *    before the remote lock.
+ *
+ *  - A process never waits for a local lock while holding another local
+ *    lock.  Separate namespaces do not change this: the only process that
+ *    waits for a cpp slot while holding something is one that holds a
+ *    remote slot, and cpp slot holders never wait on remote slots.
  */
 
 struct dcc_hostdef _dcc_local = {
@@ -134,6 +159,12 @@ struct dcc_hostdef *dcc_hostdef_local_cpp = &_dcc_local_cpp;
 
 
 /**
+ * Build the name of the lock file for slot @p iter of @p host.
+ *
+ * Local compile slots use <lockdir>/<lockname>_localhost_<n>; local
+ * preprocessor slots (dcc_hostdef_local_cpp) use <lockdir>/cpp_localhost_<n>
+ * when @p lockname is "cpu".
+ *
  * Returns a newly allocated buffer.
  **/
 int dcc_make_lock_filename(const char *lockname,
@@ -149,7 +180,19 @@ int dcc_make_lock_filename(const char *lockname,
         return ret;
 
     if (host->mode == DCC_MODE_LOCAL) {
-        if (asprintf(&buf, "%s/%s_localhost_%d", lockdir, lockname,
+        const char *prefix = lockname;
+        const char *suffix = "";
+
+        if (host == dcc_hostdef_local_cpp) {
+            /* Preprocessor slots have their own namespace; see the comment
+             * at the top of this file.  "cpu" becomes "cpp"; any other
+             * lockname gets a "_cpp" suffix so it cannot collide either. */
+            if (strcmp(lockname, "cpu") == 0)
+                prefix = "cpp";
+            else
+                suffix = "_cpp";
+        }
+        if (asprintf(&buf, "%s/%s%s_localhost_%d", lockdir, prefix, suffix,
                      iter) == -1)
             return EXIT_OUT_OF_MEMORY;
     } else if (host->mode == DCC_MODE_TCP) {
@@ -294,8 +337,8 @@ int dcc_lock_host(const char *lockname,
     }
 
     if (sys_lock(*lock_fd, block) == 0) {
-        rs_trace("got %s lock on %s slot %d as fd%d", lockname,
-                 host->hostdef_string, slot, *lock_fd);
+        rs_trace("got %s lock on %s slot %d as fd%d (%s)", lockname,
+                 host->hostdef_string, slot, *lock_fd, fname);
         free(fname);
         return 0;
     } else {
@@ -309,6 +352,13 @@ int dcc_lock_host(const char *lockname,
             ret = EXIT_BUSY;
             break;
         default:
+            if (block && errno == EINTR) {
+                /* A blocking wait was cut short by a signal, normally the
+                 * timeout in where.c; the lock is still held by someone. */
+                rs_trace("%s: wait interrupted", fname);
+                ret = EXIT_BUSY;
+                break;
+            }
             rs_log_error("lock %s failed: %s", fname, strerror(errno));
             ret = EXIT_IO_ERROR;
             break;

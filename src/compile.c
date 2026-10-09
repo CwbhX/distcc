@@ -771,6 +771,49 @@ dcc_build_somewhere(char *argv[],
         goto run_local;
     }
 
+    if (host->cpp_where == DCC_CPP_MIRROR) {
+        /* Mirrored tree: no local preprocessing, so no local cpp lock.  The
+         * helper compiles the source in its copy of this tree. */
+        int outcome = DCC_MIRROR_CLASSIC;
+        char **mirror_argv = NULL;
+        char *dotd_target = NULL;
+
+        if (deps_fname == NULL)
+            dcc_get_dotd_info(argv, &deps_fname, &needs_dotd,
+                              &sets_dotd_target, &dotd_target);
+        if ((ret = dcc_copy_argv(argv, &mirror_argv, 2)) == 0) {
+            if (needs_dotd && !sets_dotd_target) {
+                dcc_argv_append(mirror_argv, strdup("-MT"));
+                dcc_argv_append(mirror_argv,
+                                strdup(dotd_target ? dotd_target
+                                       : output_fname));
+            }
+            ret = dcc_compile_mirror(mirror_argv, input_fname, output_fname,
+                                     needs_dotd ? deps_fname : NULL,
+                                     server_stderr_fname, host, status,
+                                     &outcome);
+            dcc_free_argv(mirror_argv);
+        }
+        if (outcome == DCC_MIRROR_COMPILED)
+            goto remote_finished;
+        if (outcome == DCC_MIRROR_FAILED) {
+            bad_host(host, &cpu_lock_fd, &local_cpu_lock_fd);
+            retry_count++;
+            if (max_retries == 0 || retry_count < max_retries)
+                goto choose_host;
+            rs_log_warning("Couldn't find a host in %d attempts, retrying locally",
+                           retry_count);
+            goto fallback;
+        }
+        /* Not mirrorable, refused, or the result did not match this
+         * machine's files: send it to the same host the classic way.  The
+         * host slot is still held. */
+        host->cpp_where = DCC_CPP_ON_CLIENT;
+        dcc_get_protover_from_features(host->compr, host->cpp_where,
+                                       &host->protover);
+        *status = 0;
+    }
+
     if (!dcc_is_preprocessed(input_fname)) {
         /* Lock the local CPU, since we're going to be doing preprocessing
          * or include scanning. */
@@ -882,6 +925,7 @@ dcc_build_somewhere(char *argv[],
     /* dcc_compile_remote() already unlocked local_cpu_lock_fd. */
     local_cpu_lock_fd = -1;
 
+  remote_finished:
     dcc_enjoyed_host(host);
 
     dcc_unlock(cpu_lock_fd);

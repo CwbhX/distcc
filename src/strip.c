@@ -79,7 +79,20 @@ int dcc_strip_local_args(char **from, char ***out_argv)
     /* skip through argv, copying all arguments but skipping ones that
      * ought to be omitted */
     for (from_i = to_i = 0; from[from_i]; from_i++) {
-        if (str_equal("-D", from[from_i])
+        if (str_equal("-Xclang", from[from_i])
+            && from[from_i+1]
+            && (str_equal("-include-pch", from[from_i+1])
+                || str_equal("-include", from[from_i+1])
+                || str_equal("-imacros", from[from_i+1]))
+            && from[from_i+2] && str_equal("-Xclang", from[from_i+2])
+            && from[from_i+3]) {
+            /* "-Xclang -include-pch -Xclang FILE", as CMake writes PCH
+             * use for clang (and the same for -include and -imacros):
+             * the preprocessed source already contains what they include,
+             * so the compiler must not read it again. */
+            from_i += 3;
+        }
+        else if (str_equal("-D", from[from_i])
             || str_equal("-I", from[from_i])
             || str_equal("-U", from[from_i])
             || str_equal("-L", from[from_i])

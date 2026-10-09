@@ -260,8 +260,22 @@ static int dcc_parse_options(const char **psrc,
             p += 4;
         } else if (str_startswith("cpp", p)) {
             rs_trace("got CPP option");
+            if (host->cpp_where == DCC_CPP_MIRROR) {
+                rs_log_error("',cpp' and ',mirror' cannot be combined: %s",
+                             started);
+                return EXIT_BAD_HOSTSPEC;
+            }
             host->cpp_where = DCC_CPP_ON_SERVER;
             p += 3;
+        } else if (str_startswith("mirror", p)) {
+            rs_trace("got MIRROR option");
+            if (host->cpp_where == DCC_CPP_ON_SERVER) {
+                rs_log_error("',cpp' and ',mirror' cannot be combined: %s",
+                             started);
+                return EXIT_BAD_HOSTSPEC;
+            }
+            host->cpp_where = DCC_CPP_MIRROR;
+            p += 6;
 #ifdef HAVE_GSSAPI
         } else if (str_startswith("auth", p)) {
             rs_trace("got GSSAPI option");
@@ -427,6 +441,12 @@ int dcc_get_features_from_protover(enum dcc_protover protover,
                                    enum dcc_compress *compr,
                                    enum dcc_cpp_where *cpp_where)
 {
+    if (protover == DCC_VER_4) {
+        /* Mirror mode: the payload is one object, sent uncompressed. */
+        *compr = DCC_COMPRESS_NONE;
+        *cpp_where = DCC_CPP_MIRROR;
+        return 0;
+    }
     if (protover > 1) {
         *compr = DCC_COMPRESS_LZO1X;
     } else {
@@ -454,6 +474,13 @@ int dcc_get_protover_from_features(enum dcc_compress compr,
                                    enum dcc_protover *protover)
 {
     *protover = -1;
+
+    /* ',mirror' ignores ',lzo' for mirrored jobs; the compression setting
+     * still applies when a job falls back to the classic path. */
+    if (cpp_where == DCC_CPP_MIRROR) {
+        *protover = DCC_VER_4;
+        return *protover;
+    }
 
     if (compr == DCC_COMPRESS_NONE && cpp_where == DCC_CPP_ON_CLIENT) {
         *protover = DCC_VER_1;

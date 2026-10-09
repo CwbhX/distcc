@@ -1,0 +1,203 @@
+description of distcc protocol version 4 (mirrored tree)
+copyright (C) 2026 Clement Hathaway
+
+disclaimer
+----------
+
+This document is provided as explanation for people developing or
+debugging distcc.  Discrepancies between this document and the distcc
+code are an error in the document.  The design and its reasoning are in
+doc/mirrored-tree-design.md.
+
+protocol
+--------
+
+In protocol 4 the client sends no source.  The server (the "helper") has
+the client's tree at the same paths, compiles the source in place, and
+returns, besides the object, the dependency file and a description of
+the relevant files, directories and actual filesystem queries (DSTA).
+The client accepts the object only if they match according to the content,
+lookup, alias and directory rules below.
+
+The low level encoding (four-character tokens followed by eight hex
+digits, strings sent as a length and bytes) is the same as in protocols
+1-3.  Nothing is compressed.  A host spec option ",mirror" selects this
+protocol; ",lzo" then only applies when a job falls back to protocol 1/2.
+
+A server that does not know version 4 rejects DIST 4 and closes the
+connection. A version-4 helper without complete query records cannot
+authorize a successful result; the client retries that job in classic mode.
+
+request
+-------
+
+DIST 4
+
+CDIR <len> <bytes>
+    The client's working directory, after DISTCC_MIRROR_PATHMAP: when the
+    physical cwd starts with a mapped physical prefix, that prefix is
+    replaced with its logical name (which the client checked is the same
+    directory).
+
+ARGC <nargs>
+ARGV <len> <bytes>
+    The compiler command, as in protocol 1/2: the original -o, -MF and -MT
+    are kept; the client adds "-MT <output>" when it needs a .d without a
+    target, as for protocol 3.
+
+NCHK <n>
+    The check list, never empty: the input file, every -include-pch,
+    -include and -imacros operand (driver, -Xclang and -Xpreprocessor
+    spellings), and for each -include H the candidates H.pch and H.gch.
+    Then, n times:
+
+    CHKN <len> <bytes>    the path, as written in argv
+    CHKX <kind>           0 absent, 1 regular file, 2 something else
+    CHKS <size>           size in bytes (files are at most 4 GiB)
+    CHKM <mtime>          mtime in whole seconds
+
+CVER <len> <bytes>
+    SHA-256 (hex) of the compiler binary the client's argv[0] runs.  On
+    macOS /usr/bin tools are resolved through DEVELOPER_DIR or the
+    xcode-select link.
+
+NENV <n>
+ENVS <len> <bytes>
+    NAME=VALUE for each variable of a fixed list that is set on the client
+    and changes what the compiler reads (CPATH, C_INCLUDE_PATH,
+    CPLUS_INCLUDE_PATH, OBJC_INCLUDE_PATH, OBJCPLUS_INCLUDE_PATH, SDKROOT,
+    DEVELOPER_DIR, MACOSX_DEPLOYMENT_TARGET, IPHONEOS_DEPLOYMENT_TARGET,
+    CCC_OVERRIDE_OPTIONS, COMPILER_PATH, GCC_EXEC_PREFIX,
+    SOURCE_DATE_EPOCH, ZERO_AR_DATE).  The server sets exactly these for
+    the compiler and unsets the others of the list. A nonempty
+    CCC_OVERRIDE_OPTIONS is refused in mirror mode because it can introduce
+    unsupported options after argument validation.
+
+NRUL <n>
+RULE <len> <bytes>
+    How directory identities are computed, so that both sides agree:
+      r:<dir>    a synced source root (DISTCC_MIRROR_ROOTS)
+      x:<glob>   names left out at the top of each root
+                 (DISTCC_MIRROR_EXCLUDE)
+      b:<dir>    a build tree (logical side of DISTCC_MIRROR_PATHMAP):
+                 only sources, headers and PCHs count there
+      i:<dir>    an installed tree (DISTCC_MIRROR_INSTALLED, default
+                 /Library/Developer/CommandLineTools,
+                 /Applications/Xcode.app, /opt/homebrew)
+
+The server reads the whole request before it answers anything.
+
+response
+--------
+
+DONE 4
+
+MIRR <code>
+    0  the server compiled; the fields below follow.
+    Otherwise no result is accepted, MIRM follows, and the connection ends:
+    1  mirror mode is off, or the cwd or input is not under a
+       --mirror-root
+    2  a synced file of the check list differs (pre-check)
+    3  an argument or the compiler was refused, or the include search
+       uses an option mirror mode does not model (-iprefix, -iwithprefix*,
+       -iwithsysroot, -I-, -ivfsoverlay, ...), or complete compiler
+       filesystem-query observation was unavailable
+    4  the cwd or the input is missing
+    5  the compiler could not be confined to its job directory
+    6  the server's compiler binary is not the client's
+
+MIRM <len> <bytes>
+    Only after a nonzero MIRR: the reason, for the client's log.
+
+STAT, SERR, SOUT
+    As in protocol 2 (uncompressed).  The client holds SOUT back and only
+    prints it if it accepts the result.
+
+DOTO <len> <bytes>
+    The object; 0 bytes if the compiler failed.  If it failed, nothing else
+    follows.
+
+DOTD <len> <bytes>
+    The dependency file, with the client's target.  The server always
+    compiles with -MD (a client -MMD becomes -MD) so that system headers
+    are listed too.
+
+DSTA <len> <bytes>
+    Text, one line per item:
+
+      F <size> <mtime> <sha256> <path>     a regular file
+      D <hash> <path>                      a directory: the SHA-256 of its
+                                           sorted entries
+      L <hash> <path>                      the same, for a directory in an
+      N <kind><name>                       installed tree, followed by its
+      ...                                  entries ("f", "d", "o" or "x"
+                                           for a dangling symlink)
+      A <path>                             absent
+      O <path>                             neither file nor directory
+      Q <nofollow> <type> <alias|-> <sha256|-> <path> a filesystem query, including
+                                           successful optional-header tests
+                                           and failed lookup candidates
+      T 1                                  complete query-observation version 1
+      C <size> <mtime> <sha256> <path>     a shadow candidate (below) that
+                                           exists on the server
+
+    It must describe every prerequisite of the .d and every check-list
+    path (as files), and every directory of the include search path given
+    by argv or the environment (CPATH, C_INCLUDE_PATH, ...), the directory
+    of each of those files, and "." (as directories).
+
+    Q paths are absolute and preserve the actual syscall spelling (including
+    symlink-sensitive ".." components). nofollow is 0 for stat/open and 1
+    for lstat/readlink. type is decimal st_mode & S_IFMT, or 0 for a lookup
+    returning ENOENT/ENOTDIR. Regular files carry their content SHA-256 and
+    an opaque alias identifier (the helper's decimal device:inode pair);
+    other kinds use "-" for alias. The client requires a bijection between
+    helper alias groups and its own device:inode groups, preserving
+    #pragma once semantics even through directory symlinks. File identifiers
+    themselves need not have equal numeric values across hosts.
+    Symlinks queried without following carry the SHA-256 of their target
+    spelling; missing paths and other kinds carry "-". Directory Q records
+    compare existence/type, not a directory listing. The server deduplicates
+    queries and requires complete start/end records from every observed
+    compiler process, including the driver. Job-directory artifacts are
+    omitted. A successful result without T and Q records is refused.
+
+    Shadow candidates: for each file read (except the input), spelled S
+    relative to the search directory it lies in, every S in an earlier
+    search directory, and, if S has a directory part, every S in the
+    directory of a file read, that exists but was not read.  Both sides
+    take the search path from the compiler: "<compiler> <the job's search
+    and target flags> -x <lang> -E -v -" in the job's cwd and environment
+    (cached per compiler, cwd, flags and environment, and reused only
+    while every directory the report depends on, listed or ignored as
+    missing or duplicate, and every explicit and environment search
+    directory, is still the same directory or still absent).  The server
+    runs this probe confined like the compile.
+
+client check
+------------
+
+The client parses the .d itself, derives the same sets, and requires each
+item to be described.  Files must have the same size and SHA-256 (mtimes
+are not enough: a same-length edit within one second keeps both size and
+whole-second mtime).  Each shadow candidate that exists on the client must
+be among the server's C lines with the same content: a file only the
+client has would make the client's own compile read something else.
+Directories outside installed trees must have the same entry hash.  An installed
+directory may differ only in entries whose names are not a component of
+any path the compile read ("X.framework" also counts as "X"), since an
+include spelling is always a suffix of the path it resolved to.  Paths
+are stat()ed with symlinks followed, from the client's own cwd.
+
+Every Q record must also match on the client, with no installed-directory
+relaxation. This covers __has_include/__has_include_next and macro-generated
+queries that .d does not describe. The initial observer also refuses
+hardlinked regular query paths on both sides. Special-file queries and
+implicit driver configuration reads are also refused. An older helper
+without T 1 falls back.
+
+Only then are the object and the .d written next to their destinations and
+renamed into place.  Jobs whose dependency output does not go to a file
+(-MF -, DEPENDENCIES_OUTPUT, SUNPRO_DEPENDENCIES) are not mirrored.  On any mismatch, or a nonzero MIRR, or a failed
+compile, the job is sent to the same host by protocol 1/2 instead; the
+host is not marked as bad.

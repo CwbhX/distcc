@@ -213,6 +213,16 @@ int dcc_scan_args(char *argv[], char **input_file, char **output_file,
             } else if (!strcmp(a, "-frepo")) {
                 rs_log_info("compiler will emit .rpo files; must be local");
                 return EXIT_DISTCC_FAILED;
+            } else if ((str_startswith("-x", a) && argv[i+1]
+                        && str_endswith("-header", argv[i+1]))
+                       || !strcmp(a, "-emit-pch")
+                       || (!strcmp(a, "-Xclang") && argv[i+1]
+                           && !strcmp(argv[i+1], "-emit-pch"))) {
+                /* A precompiled header records the paths it was built
+                 * from; one built remotely from preprocessed text would
+                 * not be the one the client's compiles expect. */
+                rs_log_info("precompiled header generation must be local");
+                return EXIT_DISTCC_FAILED;
             } else if (str_startswith("-x", a)
                        && argv[i+1]
                        && !str_startswith("c", argv[i+1])

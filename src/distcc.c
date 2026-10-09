@@ -50,6 +50,7 @@
 #include "implicit.h"
 #include "compile.h"
 #include "emaillog.h"
+#include "mirror_sync.h"
 
 
 /* Name of this program, for trace.c */
@@ -85,6 +86,8 @@ static void dcc_show_usage(void)
 "   --help                     Explain usage, and exit.\n"
 "   --version                  Show version, and exit.\n"
 "   --show-hosts               Show host list, and exit.\n"
+"   --mirror-sync [HOST...]    Copy the working tree to the ',mirror' hosts\n"
+"                              (or the given ssh hosts) with rsync, and exit.\n"
 "   -j                         Show the concurrency level, as calculated from\n"
 "                              the host list, and exit.\n"
 "   --scan-includes            Show the files that distcc would send to the\n"
@@ -271,6 +274,11 @@ int main(int argc, char **argv)
         if (!strcmp(argv[1], "-j")) {
             dcc_concurrency_level();
             ret = 0;
+            goto out;
+        }
+
+        if (!strcmp(argv[1], "--mirror-sync")) {
+            ret = dcc_mirror_sync(argc - 2, argv + 2);
             goto out;
         }
 

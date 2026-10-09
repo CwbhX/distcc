@@ -85,6 +85,7 @@
 #include "srvnet.h"
 #include "hosts.h"
 #include "daemon.h"
+#include "mirror_serve.h"
 #include "stringmap.h"
 #include "dotd.h"
 #include "fix_debug_info.h"
@@ -442,6 +443,57 @@ static int dcc_check_compiler_whitelist(char *_compiler_name)
 #endif
 }
 
+/**
+ * Check that the compiler in argv[0] may be run here (DISTCC_CMDLIST, the
+ * masquerade check and the compiler whitelist) and that argv has no option
+ * that is unsafe to run for a client (-fplugin=, unknown -specs=).  May
+ * replace argv[0].  Returns 0 if the command may run.
+ **/
+int dcc_check_compiler_and_args(char **argv)
+{
+    int ret;
+    char *a;
+    int i;
+
+    if (!dcc_remap_compiler(&argv[0]))
+        return EXIT_BAD_ARGUMENTS;
+
+    if ((ret = dcc_check_compiler_masq(argv[0])))
+        return ret;
+
+    if (!opt_enable_tcp_insecure &&
+        !getenv("DISTCC_CMDLIST") &&
+        dcc_check_compiler_whitelist(argv[0]))
+        return EXIT_BAD_ARGUMENTS;
+
+    /* unsafe compiler options. See  https://youtu.be/bSkpMdDe4g4?t=53m12s
+       on securing https://godbolt.org/ */
+    for (i = 0; (a = argv[i]); i++) {
+        if (strncmp(a, "-fplugin=", strlen("-fplugin=")) == 0) {
+            rs_log_warning("-fplugin= passed, which are insecure and not supported.");
+            return EXIT_BAD_ARGUMENTS;
+        }
+        if (strncmp(a, "-specs=", strlen("-specs=")) == 0) {
+            int fail = 1;
+            if (arg_sysroot) {
+                char *spec_file = strchr(a, '=') + 1;
+                char *spec_path = alloca(strlen(spec_file) + strlen(arg_sysroot) + 8);
+                sprintf(spec_path, "%s/%s", arg_sysroot, spec_file);
+                struct stat spec_stat;
+                if (stat(spec_path, &spec_stat) != -1 && (spec_stat.st_mode & S_IFMT) == S_IFREG) {
+                  fail = 0;
+                }
+            }
+            if (fail) {
+              rs_log_warning("-specs= passed, but we cannot find the specs.");
+              return EXIT_BAD_ARGUMENTS;
+            }
+       }
+    }
+    return 0;
+}
+
+
 static const char *include_options[] = {
     "-I",
     "-include",
@@ -700,6 +752,15 @@ static int dcc_run_job(int in_fd,
 
     dcc_get_features_from_protover(protover, &compr, &cpp_where);
 
+    if (protover == DCC_VER_4) {
+        ret = dcc_mirror_serve(in_fd, out_fd, err_fname, out_fname,
+                               &argv, &orig_input, &status, &job_result);
+        if (job_result == STATS_OTHER && ret == 0)
+            job_result = -1;
+        tcp_cork_sock(out_fd, 0);
+        goto out_cleanup;
+    }
+
     if (cpp_where == DCC_CPP_ON_SERVER) {
         if ((ret = make_temp_dir_and_chdir_for_cpp(in_fd,
                           &temp_dir, &client_cwd, &server_cwd)))
@@ -755,42 +816,12 @@ static int dcc_run_job(int in_fd,
             goto out_cleanup;
     }
 
-    if (!dcc_remap_compiler(&argv[0]))
+    if ((compile_ret = dcc_check_compiler_and_args(argv))) {
+        /* Keep the exit code of a failed masquerade check, as before. */
+        if (compile_ret == EXIT_DISTCC_FAILED)
+            ret = compile_ret;
+        compile_ret = 0;
         goto out_cleanup;
-
-    if ((ret = dcc_check_compiler_masq(argv[0])))
-        goto out_cleanup;
-
-    if (!opt_enable_tcp_insecure &&
-        !getenv("DISTCC_CMDLIST") &&
-        dcc_check_compiler_whitelist(argv[0]))
-        goto out_cleanup;
-
-    /* unsafe compiler options. See  https://youtu.be/bSkpMdDe4g4?t=53m12s
-       on securing https://godbolt.org/ */
-    char *a;
-    int i;
-    for (i = 0; (a = argv[i]); i++) {
-        if (strncmp(a, "-fplugin=", strlen("-fplugin=")) == 0) {
-            rs_log_warning("-fplugin= passed, which are insecure and not supported.");
-            goto out_cleanup;
-        }
-        if (strncmp(a, "-specs=", strlen("-specs=")) == 0) {
-            int fail = 1;
-            if (arg_sysroot) {
-                char *spec_file = strchr(a, '=') + 1;
-                char *spec_path = alloca(strlen(spec_file) + strlen(arg_sysroot) + 8);
-                sprintf(spec_path, "%s/%s", arg_sysroot, spec_file);
-                struct stat spec_stat;
-                if (stat(spec_path, &spec_stat) != -1 && (spec_stat.st_mode & S_IFMT) == S_IFREG) {
-                  fail = 0;
-                }
-            }
-            if (fail) {
-              rs_log_warning("-specs= passed, but we cannot find the specs.");
-              goto out_cleanup;
-            }
-       }
     }
 
     if ((compile_ret = dcc_spawn_child(argv, &cc_pid,

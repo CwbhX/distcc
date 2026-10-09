@@ -49,6 +49,7 @@
 #include "lock.h"
 #include "compile.h"
 #include "bulk.h"
+#include "mirror_client.h"
 #ifdef HAVE_GSSAPI
 #include "auth.h"
 
@@ -389,5 +390,116 @@ int dcc_compile_remote(char **argv,
         }
     }
 
+    return ret;
+}
+
+
+/**
+ * Try to compile in the helper's mirrored tree (protocol 4).
+ *
+ * On return *outcome is DCC_MIRROR_COMPILED when the helper ran the
+ * compiler (then *status is its status, and on success the object and .d
+ * are verified and in place), DCC_MIRROR_CLASSIC when the job should go to
+ * the same host the classic way (not mirrorable, refused by the daemon, or
+ * the result did not match this machine's files), or DCC_MIRROR_FAILED
+ * when the host could not be reached or the conversation broke.
+ **/
+int dcc_compile_mirror(char **argv,
+                       char *input_fname,
+                       char *output_fname,
+                       char *deps_fname,
+                       char *server_stderr_fname,
+                       struct dcc_hostdef *host,
+                       int *status,
+                       int *outcome)
+{
+    struct dcc_mirror_job job;
+    int to_net_fd = -1, from_net_fd = -1;
+    pid_t ssh_pid = 0;
+    int ssh_status, ret, mirr = 0, verify_failed = 0;
+    struct timeval before, after;
+
+    *status = 0;
+    *outcome = DCC_MIRROR_CLASSIC;
+    dcc_mirror_job_init(&job);
+
+    if (gettimeofday(&before, NULL))
+        rs_log_warning("gettimeofday failed");
+
+    job.argv = argv;
+    if (dcc_mirror_prepare(argv, input_fname, &job) != 0) {
+        rs_trace("job not mirrorable; using the classic path");
+        ret = 0;
+        goto out;
+    }
+
+    dcc_note_execution(host, argv);
+    dcc_note_state(DCC_PHASE_CONNECT, input_fname, host->hostname, DCC_REMOTE);
+    if ((ret = dcc_remote_connect(host, &to_net_fd, &from_net_fd, &ssh_pid))) {
+        *outcome = DCC_MIRROR_FAILED;
+        goto out;
+    }
+#ifdef HAVE_GSSAPI
+    if (host->authenticate) {
+        if ((ret = dcc_gssapi_perform_requested_security(host, to_net_fd,
+                                                         from_net_fd))) {
+            *outcome = DCC_MIRROR_FAILED;
+            goto out;
+        }
+        dcc_gssapi_delete_ctx(&distcc_ctx_handle);
+    }
+#endif
+
+    dcc_note_state(DCC_PHASE_SEND, NULL, NULL, DCC_REMOTE);
+    if ((ret = dcc_mirror_send_request(to_net_fd, argv, &job))) {
+        *outcome = DCC_MIRROR_FAILED;
+        goto out;
+    }
+    dcc_note_state(DCC_PHASE_COMPILE, NULL, host->hostname, DCC_REMOTE);
+    if ((ret = dcc_mirror_retrieve_results(from_net_fd, status, output_fname,
+                                           deps_fname, server_stderr_fname,
+                                           &job, &mirr, &verify_failed))) {
+        *outcome = DCC_MIRROR_FAILED;
+        goto out;
+    }
+    if (mirr != 0) {
+        rs_log(RS_LOG_INFO|RS_LOG_NONAME,
+               "mirror: %s refused %s (MIRR %d); using the classic path",
+               host->hostname, input_fname, mirr);
+        goto out;
+    }
+    if (verify_failed) {
+        *status = 0;
+        goto out;
+    }
+    if (*status != 0) {
+        /* The compile failed in the mirror.  That may be the mirror's
+         * fault (a file missing there), so redo it the classic way on the
+         * same host instead of blaming the host; a real error fails there
+         * too and is then retried locally as usual. */
+        rs_log(RS_LOG_INFO|RS_LOG_NONAME,
+               "mirror: compile of %s failed on %s; using the classic path",
+               input_fname, host->hostname);
+        *status = 0;
+        goto out;
+    }
+    *outcome = DCC_MIRROR_COMPILED;
+
+    if (gettimeofday(&after, NULL) == 0) {
+        double secs, rate;
+        dcc_calc_rate(0, &before, &after, &secs, &rate);
+        rs_log(RS_LOG_INFO|RS_LOG_NONAME,
+               "%s compiled in the mirror on %s in %.4fs",
+               input_fname, host->hostname, secs);
+    }
+
+  out:
+    if (to_net_fd != from_net_fd && to_net_fd != -1)
+        dcc_close(to_net_fd);
+    if (from_net_fd != -1)
+        dcc_close(from_net_fd);
+    if (ssh_pid)
+        dcc_collect_child("ssh", ssh_pid, &ssh_status, timeout_null_fd);
+    dcc_mirror_job_free(&job);
     return ret;
 }

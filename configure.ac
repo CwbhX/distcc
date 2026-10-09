@@ -27,6 +27,14 @@ linux*)
 	;;
 esac
 
+# Mirror helpers trace compiler filesystem lookups through dyld interposition.
+# Other platforms retain classic/pump mode and do not build this library.
+MIRROR_TRACE_LIBRARY=
+case "${host_os}" in
+darwin*) MIRROR_TRACE_LIBRARY=distcc-mirror-trace.dylib ;;
+esac
+AC_SUBST(MIRROR_TRACE_LIBRARY)
+
 # FreeBSD installs its version of libpopt into /usr/local/, but does
 # not put that on the default library and header path.
 # Solaris doesn't even ship libpopt.  We used to add that path if
@@ -89,11 +97,68 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[]], [[
 
 AC_ARG_ENABLE(pump-mode,
 	AS_HELP_STRING([--disable-pump-mode],[include server support (pump mode), requires python]),
-		[pump_mode=${enableval}], [pump_mode=yes])
+		[pump_mode=${enableval}], [pump_mode=auto])
 
 AM_PATH_PYTHON([3.1],,[:])
 AC_ARG_VAR(PYTHON, [Python interpreter])
 AC_SUBST(PYTHON_RELATIVE_LIB)
+
+# Pump mode needs the include server, which is built with Python's
+# setuptools.  Check for it now rather than failing with a Python
+# traceback half way through "make".  Python itself is still looked for
+# above even without pump mode, because the test suite uses it.
+#
+# pump_mode is "auto" unless --enable-pump-mode or --disable-pump-mode was
+# given: a missing prerequisite then just turns pump mode off with a
+# warning, while an explicit --enable-pump-mode makes it an error.
+if test "x${pump_mode}" != xno; then
+    if test "x$PYTHON" = "x:"; then
+        setuptools_problem="no suitable Python found"
+    else
+        AC_MSG_CHECKING([whether $PYTHON has setuptools])
+        if $PYTHON -c 'import setuptools' >/dev/null 2>&1; then
+            AC_MSG_RESULT(yes)
+            setuptools_problem=
+        else
+            AC_MSG_RESULT(no)
+            setuptools_problem="$PYTHON cannot import setuptools"
+        fi
+    fi
+    if test -n "$setuptools_problem"; then
+        setuptools_advice="Install setuptools for that interpreter (e.g. the
+python3-setuptools package, or on macOS with Homebrew \"brew install
+python-setuptools\"), choose another interpreter with PYTHON=/path/to/python3,
+or configure with --disable-pump-mode."
+        if test "x${pump_mode}" = xyes; then
+            AC_MSG_ERROR([pump mode needs the Python setuptools module to build the
+include server, but $setuptools_problem.  $setuptools_advice])
+        else
+            AC_MSG_WARN([pump mode (include server) will not be built: $setuptools_problem.
+$setuptools_advice])
+            pump_mode=no
+        fi
+    else
+        pump_mode=yes
+    fi
+fi
+AC_MSG_CHECKING([whether to build pump mode (include server)])
+AC_MSG_RESULT([$pump_mode])
+
+# Makefile targets that only apply to pump mode.
+if test "x${pump_mode}" = xyes; then
+    PUMP_ALL="pump include-server"
+    INSTALL_PUMP="install-include-server"
+    UNINSTALL_PUMP="uninstall-include-server"
+    CHECK_PUMP="include-server-maintainer-check pump-maintainer-check"
+    INSTALLCHECK_PUMP="pump-installcheck"
+    PUMP_MAN1='$(pump_man1_MEN)'
+fi
+AC_SUBST(PUMP_ALL)
+AC_SUBST(INSTALL_PUMP)
+AC_SUBST(UNINSTALL_PUMP)
+AC_SUBST(CHECK_PUMP)
+AC_SUBST(INSTALLCHECK_PUMP)
+AC_SUBST(PUMP_MAN1)
 
 AC_ARG_ENABLE(rfc2553,
 	AS_HELP_STRING([--enable-rfc2553],[use getaddrinfo, getnameinfo, etc]))
